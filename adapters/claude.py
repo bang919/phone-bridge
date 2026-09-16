@@ -29,16 +29,16 @@ RELAY_CMD = "python3 -u %s --relay" % os.path.join(SKILL_DIR, "bridge.py")
 # 「不能发」时给手机的一句实话。
 #
 # **别把 shell 命令甩给用户。** 起中继这件事，在电脑上跟那个对话说一句话就行
-# ——「起一下 phone-bridge」会命中 SKILL.md，那边的 agent 自己知道该起中继
+# ——「启动 phone-bridge」会命中 SKILL.md，那边的 agent 自己知道该起中继
 # （SKILL.md 里写了：已经有前端在跑就起中继，没有再起前端）。
 # 用户要的是"接着说"，不是"看懂一条命令行"。
 BLOCKED_NO_RELAY = (
     "电脑上这个对话正开着，但它那边还没起 phone-bridge。"
-    "在那个对话里跟它说一句「起一下 phone-bridge」，这边就能发了。"
+    "在那个对话里跟它说一句「启动 phone-bridge」，这边就能发了。"
 )
 BLOCKED_NOT_RUNNING = (
     "这个对话没在跑，手机上只能看。"
-    "在电脑上把它打开，再跟它说一句「起一下 phone-bridge」，就能发了。"
+    "在电脑上把它打开，再跟它说一句「启动 phone-bridge」，就能发了。"
 )
 
 # 「没活进程的对话」怎么发：自己起一个 headless 会话，stdin 就是我们的
