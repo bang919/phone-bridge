@@ -69,17 +69,24 @@
   /* 绿 = 在跑且闲着；橙闪 = 在跑且正在干活（想事情 / 跑工具 / 压缩上下文） */
   .dot.busy { background: #ff9f0a; animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
-  /* 能不能发，一个词说清。整行变灰是"那边还没起服务"，不是"坏了"——
-     点进去会说怎么办（去电脑上跟那个对话说一句「启动 phone-bridge」）。 */
+  /* 能不能发，一眼分层：上面是能聊的，下面全是只能看的。别让人逐行去看标签。 */
   li.off { opacity: .5; }
+  ul.sessions li.sec {
+    position: sticky; top: 0; z-index: 2;
+    padding: 14px 14px 7px; font-size: 12px; color: var(--dim);
+    background: var(--bg); border-bottom: 0;
+  }
+  ul.sessions li.sec:active { background: var(--bg); }
+  ul.sessions li.tip {
+    padding: 0 14px 14px; font-size: 12px; color: var(--dim); line-height: 1.5;
+    border-bottom: 0;
+  }
   .tag {
     font-size: 11px; padding: 1px 6px; border-radius: 5px;
     flex: none; white-space: nowrap;
   }
-  .tag.on   { background: #dff3e3; color: #1f6b33; }
   .tag.wait { background: #ffeccf; color: #8a5a00; }
   @media (prefers-color-scheme: dark) {
-    .tag.on   { background: #1c3a24; color: #8fd8a3; }
     .tag.wait { background: #3d2f14; color: #f0be75; }
   }
   .row2 {
@@ -243,14 +250,11 @@ function shortCwd(c) {
   return parts.slice(-2).join("/");
 }
 
-/* 能发不能发，一个词说清。**只在"真的在跑"的会话上标**：历史对话本来就没在跑，
-   点进去看一次就够了；codex 那 80 条更是本来就不能写，每条挂一个「只读」只是
-   噪音。所以这里只分两种——在跑的能发（绿）、在跑的还不能发（橙，整行变灰）。 */
+/* 「可以聊」那一层不用再逐行标一遍——分组标题已经说了。这里只标一件分组说不清
+   的事：**它其实在跑，只是还没启动服务**，所以点进去有救（去那边说一句话就行）。
+   历史对话和 codex 那种是"本来就不能写"，标了只是噪音。 */
 function stateTag(s) {
-  if (!s.live) return "";
-  return s.can_send
-    ? '<span class="tag on">可发送</span>'
-    : '<span class="tag wait">待启动</span>';
+  return (s.live && !s.can_send) ? '<span class="tag wait">待启动</span>' : "";
 }
 
 async function api(path, opts) {
@@ -293,7 +297,9 @@ async function loadSessions() {
       ul.innerHTML = '<div class="empty">没找到会话</div>';
       return list;
     }
-    ul.innerHTML = list.map((s) => `
+    /* 两层：上面是能聊的，下面是只能看的。顺序不变（都按最后活动时间排），
+       只是中间切一刀——出门在外想找"能说话的那个"，不用在一屏灰里翻。 */
+    const row = (s) => `
       <li class="${s.live && !s.can_send ? "off" : ""}"
           data-app="${esc(s.app)}" data-id="${esc(s.id)}">
         <a href="#">
@@ -306,8 +312,22 @@ async function loadSessions() {
           <div class="row2">${esc(shortCwd(s.cwd))} · ${esc(ago(s.mtime))}${
             s.busy ? " · 正在干活…" : ""}</div>
         </a>
-      </li>`).join("");
-    ul.querySelectorAll("li").forEach((li) => {
+      </li>`;
+    const can = list.filter((s) => s.can_send);
+    const rest = list.filter((s) => !s.can_send);
+    let html = '<li class="sec">可以聊 · ' + can.length + "</li>";
+    if (!can.length) {
+      // 空着的时候最该说话：用户多半就是"出门了、想接着说"，却不知道要先在电脑上开一下。
+      html += '<li class="tip">现在没有可以聊的对话。' +
+        "在电脑上打开一个，跟它说一句「启动 phone-bridge」，它就上来了。</li>";
+    }
+    html += can.map(row).join("");
+    if (rest.length) {
+      html += '<li class="sec">只能看 · ' + rest.length + "</li>";
+      html += rest.map(row).join("");
+    }
+    ul.innerHTML = html;
+    ul.querySelectorAll("li[data-id]").forEach((li) => {
       li.querySelector("a").addEventListener("click", (e) => {
         e.preventDefault();
         const s = list.find(
