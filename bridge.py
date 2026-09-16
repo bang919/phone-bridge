@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -30,6 +31,68 @@ UI_PATH = os.path.join(HERE, "ui.html")
 WATCH_INTERVAL = 5
 RELAY_TIMEOUT = 15
 HOUSEKEEPING_INTERVAL = 60
+
+# 赞助位（列表页两组之间那一条）。**内容不在这个文件里**——改 GitHub 上仓库根目录的
+# ads.json 就行，不用碰这台机器，也不用重启。前端每 ADS_TTL 秒去拉一次。
+#
+# 拉不到不算错：没网、被墙、json 写坏了，一律退回技能目录里自带的 ads.json；
+# 连那份也没有就返回空。**广告永远不该把功能弄挂。**
+ADS_URL = os.environ.get("PHONE_BRIDGE_ADS_URL") or (
+    "https://raw.githubusercontent.com/bang919/phone-bridge/main/ads.json"
+)
+ADS_TTL = 300
+ADS_PATH = os.path.join(HERE, "ads.json")
+_ADS_CACHE = {"at": 0.0, "list": None}
+_ADS_LOCK = threading.Lock()
+
+
+def _clean_ads(raw):
+    """挑出能用的条目。**只收 http(s) 的 url**——它会被塞进 <a href>，
+    一个 `javascript:` 就能在手机上执行脚本，而这份内容来自网络。"""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not name or not url.startswith(("http://", "https://")):
+            continue
+        out.append({
+            "name": name,
+            "desc": str(item.get("desc") or "").strip(),
+            "url": url,
+        })
+    return out
+
+
+def _read_ads_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return _clean_ads(json.load(fh).get("ads"))
+    except Exception:
+        return []
+
+
+def load_ads():
+    with _ADS_LOCK:
+        now = time.time()
+        if _ADS_CACHE["list"] is not None and now - _ADS_CACHE["at"] < ADS_TTL:
+            return _ADS_CACHE["list"]
+        out = []
+        try:
+            with urllib.request.urlopen(ADS_URL, timeout=5) as fh:
+                out = _clean_ads(json.loads(fh.read().decode("utf-8")).get("ads"))
+        except Exception as exc:
+            print("[bridge] 拉赞助位失败（用本地那份）：%s" % exc)
+        if not out:
+            out = _read_ads_file(ADS_PATH)
+        # **不管成没成，都记上时间。** 否则网络不通时每个请求都要等满 5 秒超时——
+        # 广告拿不到就拿不到，5 分钟后再试，不能拖累页面。
+        _ADS_CACHE["at"] = now
+        _ADS_CACHE["list"] = out
+        return out
 
 
 def tailscale_ip():
@@ -113,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/sessions":
                 return self._send(200, {"sessions": self._all_sessions()})
+
+            if path == "/api/ads":
+                return self._send(200, {"ads": load_ads()})
 
             if path == "/api/messages":
                 app = (query.get("app") or [""])[0]

@@ -1,0 +1,19 @@
+{
+  "ads": [
+    {
+      "name": "OpenCode Go",
+      "desc": "可配合任何代理使用。每月 $10，尽情享用 DeepSeek4.1。如有需要可充值。随时取消。",
+      "url": "https://opencode.ai/zh/go"
+    },
+    {
+      "name": "星辰AI",
+      "desc": "作图推荐，Image2 低至 ¥0.025/张。",
+      "url": "https://xxcapi.top/"
+    },
+    {
+      "name": "OpenCanvas",
+      "desc": "视频推荐，SeekDance2.0 低至 ¥0.1/秒。",
+      "url": "https://canvas.yida6.com/"
+    }
+  ]
+}
