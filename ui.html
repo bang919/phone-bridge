@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="icon" href="data:,">
+<title>phone-bridge</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1c1c1e; --dim: #8e8e93; --line: #e5e5ea;
+    --me: #007aff; --peer: #f2f2f7; --warn: #ff3b30;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --fg: #f2f2f7; --dim: #8e8e93; --line: #2c2c2e;
+      --me: #0a84ff; --peer: #1c1c1e; --warn: #ff453a;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+    overscroll-behavior: none;
+  }
+  .view { display: none; flex-direction: column; height: 100%; }
+  .view.active { display: flex; }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; gap: 8px;
+    padding: max(12px, env(safe-area-inset-top)) 14px 12px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 17px; margin: 0; flex: 1; font-weight: 600; }
+  header .sub { font-size: 12px; color: var(--dim); font-weight: 400; }
+  button.back {
+    background: none; border: 0; color: var(--me); font-size: 17px;
+    padding: 0 4px 0 0; cursor: pointer;
+  }
+  .scroll { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  ul.sessions { list-style: none; margin: 0; padding: 0; }
+  ul.sessions li { border-bottom: 1px solid var(--line); }
+  ul.sessions li:active { background: var(--peer); }
+  ul.sessions a {
+    display: block; padding: 14px; color: inherit; text-decoration: none;
+  }
+  .row1 { display: flex; align-items: center; gap: 6px; }
+  .title {
+    font-weight: 500; flex: 1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .badge {
+    font-size: 11px; padding: 1px 6px; border-radius: 5px;
+    background: var(--peer); color: var(--dim);
+  }
+  .badge.claude { background: #e8def8; color: #4a2f7a; }
+  .badge.codex  { background: #d8ead8; color: #25592c; }
+  @media (prefers-color-scheme: dark) {
+    .badge.claude { background: #332552; color: #cbb8f0; }
+    .badge.codex  { background: #1e3a22; color: #9fd8a8; }
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: #34c759;
+    flex: none;
+  }
+  /* 绿 = 在跑且闲着；橙闪 = 在跑且正在干活（想事情 / 跑工具 / 压缩上下文） */
+  .dot.busy { background: #ff9f0a; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
+  .row2 {
+    font-size: 12px; color: var(--dim); margin-top: 3px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .empty { padding: 40px 18px; color: var(--dim); text-align: center; }
+
+  /* 对话 */
+  .msgs { padding: 12px 12px 4px; }
+  .msg { margin-bottom: 14px; display: flex; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 86%; padding: 9px 13px; border-radius: 17px;
+    white-space: pre-wrap; word-break: break-word;
+    font-size: 15px; line-height: 1.45;
+  }
+  .msg.user .bubble { background: var(--me); color: #fff; border-bottom-right-radius: 5px; }
+  .msg.assistant .bubble { background: var(--peer); border-bottom-left-radius: 5px; }
+  .msg .via {
+    font-size: 10px; opacity: .65; display: block; margin-bottom: 3px;
+  }
+  .composer {
+    display: flex; gap: 8px; align-items: flex-end;
+    padding: 10px 12px max(10px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line); background: var(--bg);
+  }
+  .composer textarea {
+    flex: 1; resize: none; font: inherit; color: inherit;
+    background: var(--peer); border: 0; border-radius: 18px;
+    padding: 9px 14px; max-height: 140px; min-height: 38px;
+    outline: none;
+  }
+  .composer button {
+    background: var(--me); color: #fff; border: 0; border-radius: 50%;
+    width: 38px; height: 38px; font-size: 17px; flex: none; cursor: pointer;
+  }
+  .composer button:disabled { opacity: .35; }
+  .notice {
+    padding: 9px 14px; font-size: 12px; color: var(--dim);
+    border-top: 1px solid var(--line); text-align: center;
+  }
+  .err { color: var(--warn); }
+
+  /* 压缩摘要：不是人打的，折起来放中间 */
+  .msg.note { display: block; }
+  .msg.note details { max-width: 86%; margin: 0 auto; }
+  .msg.note summary {
+    font-size: 12px; color: var(--dim); text-align: center;
+    cursor: pointer; list-style: none; padding: 6px 0;
+  }
+  .msg.note summary::-webkit-details-marker { display: none; }
+  .msg.note summary::before { content: "▸ "; }
+  .msg.note details[open] summary::before { content: "▾ "; }
+  .msg.note .note-body {
+    font-size: 12px; line-height: 1.5; color: var(--dim);
+    white-space: pre-wrap; word-break: break-word;
+    background: var(--peer); border-radius: 12px;
+    padding: 10px 12px; max-height: 45vh; overflow-y: auto;
+  }
+
+  /* 系统自己产生的一行说明（上下文压缩、后台任务通知）：居中的细虚线，
+     不是气泡 —— 它既不是用户打的，也不是模型说的 */
+  .msg.sysline { display: block; }
+  .msg.sysline .line {
+    display: block; text-align: center; font-size: 11px; color: var(--dim);
+    max-width: 92%; margin: 0 auto 14px; padding: 4px 10px;
+    border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line);
+  }
+
+  /* 正在干活：气泡位置的三个跳点，代替「已发送但还没回复」的空白 */
+  .typing {
+    display: flex; gap: 4px; align-items: center;
+    padding: 0 16px 14px; font-size: 12px; color: var(--dim);
+  }
+  .typing .b {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor; animation: blink 1.2s infinite;
+  }
+  .typing .b:nth-child(2) { animation-delay: .2s; }
+  .typing .b:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 60%, 100% { opacity: .25 } 30% { opacity: 1 } }
+</style>
+</head>
+<body>
+
+<!-- 会话列表 -->
+<div id="listView" class="view active">
+  <header>
+    <h1>会话<span class="sub" id="listSub"></span></h1>
+    <button class="back" id="refreshBtn" title="刷新">刷新</button>
+  </header>
+  <div class="scroll"><ul class="sessions" id="sessions"></ul></div>
+</div>
+
+<!-- 对话 -->
+<div id="chatView" class="view">
+  <header>
+    <button class="back" id="backBtn">‹ 返回</button>
+    <div style="flex:1;min-width:0">
+      <h1 id="chatTitle" style="font-size:16px">…</h1>
+      <div class="sub" id="chatSub"></div>
+    </div>
+  </header>
+  <div class="scroll" id="chatScroll">
+    <div class="msgs" id="msgs"></div>
+    <div class="typing" id="typing" style="display:none">
+      <span class="b"></span><span class="b"></span><span class="b"></span>
+      <span style="margin-left:4px">正在干活…</span>
+    </div>
+  </div>
+  <div class="notice" id="notice" style="display:none"></div>
+  <div class="composer" id="composer">
+    <textarea id="input" rows="1" placeholder="发消息…"></textarea>
+    <button id="sendBtn" disabled>↑</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+/* 直接打开文件（file://）时没有任何 API 可用，得给出正确地址而不是一堆 Failed to fetch */
+const IS_FILE = location.protocol === "file:";
+let cur = null;      // {app, id, title, can_send}
+let pollTimer = null;
+// 画面上画着的是哪一段：winFrom/winTo 是**绝对序号**（服务端给每条消息带了 i）。
+// 不能用"这一批比上一批长了几条"来判断新消息——服务端返回的是最后 N 条的
+// 滑动窗口，窗口一满长度就不变了，那样判断会永远判成"没有新消息"，
+// 界面从此不再更新（现象像"手机发的话被吃掉了"）。
+let winFrom = 0;
+let winTo = -1;
+let cache = [];      // 最近一次拉到的会话列表，供刷新后恢复现场
+let jumpToEnd = false;  // 刚打开对话时强制滚到底部
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+function ago(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, (Date.now() / 1000) - ts);
+  if (s < 60) return "刚刚";
+  if (s < 3600) return Math.floor(s / 60) + " 分钟前";
+  if (s < 86400) return Math.floor(s / 3600) + " 小时前";
+  return Math.floor(s / 86400) + " 天前";
+}
+function shortCwd(c) {
+  if (!c) return "";
+  const parts = c.split("/").filter(Boolean);
+  return parts.slice(-2).join("/");
+}
+
+/* 发不进去的会话，在列表里就把原因摆一行——别让人点进去才发现输入框没了。
+   只在"电脑端真的开着"时标：那是个**状态**问题（在那边起个中继就好），值得单独
+   说一句。codex 那种"这个 App 本来就不能写"是另一回事，80 行都挂同一句话只是
+   噪音，进对话页看一次就够了。 */
+function hint(s) {
+  if (s.can_send) return " · 可发送";
+  if (s.live && s.blocked) return " · " + esc(s.blocked);
+  return "";
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+function setNotice(text, isErr) {
+  const n = $("notice");
+  if (!text) {
+    n.style.display = "none";
+    n.textContent = "";
+    return;
+  }
+  n.style.display = "block";
+  n.textContent = text;
+  n.className = "notice" + (isErr ? " err" : "");
+}
+
+/* ---------- 会话列表 ---------- */
+
+async function loadSessions() {
+  if (IS_FILE) {
+    $("sessions").innerHTML =
+      '<div class="empty">这个页面得由 bridge 发给你，直接打开文件不行。<br><br>' +
+      "打开 bridge 启动时打印的那个地址，比如：<br>" +
+      "本机：<b>http://127.0.0.1:8971</b><br>手机：<b>http://&lt;Tailscale IP&gt;:8971</b><br>" +
+      '<span style="opacity:.6">（8971 是默认端口，启动时改过 --port 的话按实际）</span></div>';
+    return;
+  }
+  try {
+    const data = await api("/api/sessions");
+    const list = data.sessions || [];
+    cache = list;
+    $("listSub").textContent = " · " + list.length;
+    const ul = $("sessions");
+    if (!list.length) {
+      ul.innerHTML = '<div class="empty">没找到会话</div>';
+      return list;
+    }
+    ul.innerHTML = list.map((s) => `
+      <li data-app="${esc(s.app)}" data-id="${esc(s.id)}">
+        <a href="#">
+          <div class="row1">
+            <span class="badge ${esc(s.app)}">${esc(s.app)}</span>
+            ${s.live ? `<span class="dot${s.busy ? " busy" : ""}"></span>` : ""}
+            <span class="title">${esc(s.title)}</span>
+          </div>
+          <div class="row2">${esc(shortCwd(s.cwd))} · ${esc(ago(s.mtime))}${
+            s.busy ? " · 正在干活…" : ""}${hint(s)}</div>
+        </a>
+      </li>`).join("");
+    ul.querySelectorAll("li").forEach((li) => {
+      li.querySelector("a").addEventListener("click", (e) => {
+        e.preventDefault();
+        const s = list.find(
+          (x) => x.app === li.dataset.app && x.id === li.dataset.id
+        );
+        openChat(s);
+      });
+    });
+  } catch (e) {
+    $("sessions").innerHTML =
+      '<div class="empty err">读取失败：' + esc(e.message) + "</div>";
+  }
+}
+
+/* ---------- 对话 ---------- */
+
+function openChat(s) {
+  cur = s;
+  winFrom = 0;
+  winTo = -1;
+  jumpToEnd = true;
+  $("chatTitle").textContent = s.title || s.id;
+  $("chatSub").textContent = (s.app + " · " + shortCwd(s.cwd)).replace(/ · $/, "");
+  $("msgs").innerHTML = "";
+  $("typing").style.display = "none";
+  $("input").value = "";
+  setNotice("", false);
+  $("composer").style.display = s.can_send ? "flex" : "none";
+  $("listView").classList.remove("active");
+  $("chatView").classList.add("active");
+  location.hash = s.app + "/" + s.id;
+  refreshChat();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(refreshChat, 2000);
+}
+
+function renderMsgs(msgs) {
+  const box = $("msgs");
+  const sc = $("chatScroll");
+  const stick = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80;
+
+  if (!msgs.length) {
+    box.innerHTML = "";
+    winFrom = 0;
+    winTo = -1;
+    return;
+  }
+  // 按**绝对序号**对账，而不是按长度差。服务端给的是最后 N 条：
+  // 窗口一满，前面滑走几条、后面补上几条，长度不变但下标整体平移。
+  const firstIdx = msgs[0].i;
+  const drop = firstIdx - winFrom;
+  if (drop < 0 || drop >= box.children.length) {
+    box.innerHTML = "";            // 换会话、重载，或者一次滑走的比画着的还多
+    winFrom = firstIdx;
+    winTo = firstIdx - 1;
+  } else if (drop > 0) {
+    for (let k = 0; k < drop; k++) box.removeChild(box.firstChild);
+    winFrom = firstIdx;            // 顶上滑走的，跟着删掉；winTo 不动
+  }
+
+  for (const m of msgs) {
+    if (m.i <= winTo) continue;
+    winTo = m.i;
+    const div = document.createElement("div");
+    if (m.via === "compaction" || m.via === "note") {
+      div.className = "msg sysline";
+      const line = document.createElement("span");
+      line.className = "line";
+      line.textContent = m.text;
+      div.appendChild(line);
+      box.appendChild(div);
+      continue;
+    }
+    if (m.via === "summary") {
+      div.className = "msg note";
+      const d = document.createElement("details");
+      const s = document.createElement("summary");
+      s.textContent = "上下文压缩摘要";
+      const body = document.createElement("div");
+      body.className = "note-body";
+      body.textContent = m.text;
+      d.appendChild(s);
+      d.appendChild(body);
+      div.appendChild(d);
+      box.appendChild(div);
+      continue;
+    }
+    const role = m.role === "user" ? "user" : "assistant";
+    div.className = "msg " + role;
+    const via = m.via === "peer"
+      ? '<span class="via">来自外部注入</span>' : "";
+    div.innerHTML = '<div class="bubble">' + via + esc(m.text) + "</div>";
+    box.appendChild(div);
+  }
+  if (stick || jumpToEnd) {
+    sc.scrollTop = sc.scrollHeight;
+    jumpToEnd = false;
+  }
+}
+
+async function refreshChat() {
+  if (!cur) return;
+  try {
+    const data = await api(
+      "/api/messages?app=" + encodeURIComponent(cur.app) +
+      "&sid=" + encodeURIComponent(cur.id)
+    );
+    renderMsgs(data.messages || []);
+    cur.can_send = data.can_send;
+    cur.busy = data.busy;
+    $("typing").style.display = data.busy ? "flex" : "none";
+    $("composer").style.display = data.can_send ? "flex" : "none";
+    // 「能发」有两种性质：注入进一个正在跑的会话，或者**另起一个 agent**。
+    // 后者是真的会动工具的，界面得说出来，别让一个蓝泡泡看起来像在跟自己说话。
+    setNotice(
+      data.can_send ? (data.note || "") : (data.blocked || "这个会话不能发送"),
+      false
+    );
+  } catch (e) {
+    setNotice(e.message, true);
+  }
+}
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || !cur) return;
+  $("sendBtn").disabled = true;
+  try {
+    await api("/api/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app: cur.app, sid: cur.id, text: text }),
+    });
+    $("input").value = "";
+    $("input").style.height = "auto";
+    setNotice("", false);
+    setTimeout(refreshChat, 400);
+  } catch (e) {
+    setNotice("发送失败：" + e.message, true);
+  }
+  $("sendBtn").disabled = false;
+}
+
+/* ---------- 事件 ---------- */
+
+$("backBtn").addEventListener("click", () => {
+  clearInterval(pollTimer);
+  cur = null;
+  location.hash = "";
+  $("chatView").classList.remove("active");
+  $("listView").classList.add("active");
+  loadSessions();
+});
+$("refreshBtn").addEventListener("click", loadSessions);
+$("sendBtn").addEventListener("click", send);
+$("input").addEventListener("input", (e) => {
+  e.target.style.height = "auto";
+  e.target.style.height = Math.min(e.target.scrollHeight, 140) + "px";
+  $("sendBtn").disabled = !e.target.value.trim();
+});
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+});
+
+/* 手机上切出去再回来，Safari 会重载页面 —— 靠 hash 把对话原样接回来 */
+async function boot() {
+  await loadSessions();
+  if (IS_FILE) return;
+  const parts = decodeURIComponent(location.hash.replace(/^#/, "")).split("/");
+  if (parts.length < 2 || !parts[0] || !parts[1]) return;
+  const hit = cache.find((x) => x.app === parts[0] && x.id === parts[1]);
+  openChat(hit || { app: parts[0], id: parts[1], title: parts[1], cwd: "", can_send: false });
+}
+
+window.addEventListener("hashchange", () => {
+  if (!cur && location.hash.length > 1) boot();
+});
+
+boot();
+</script>
+</body>
+</html>
