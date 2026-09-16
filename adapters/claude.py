@@ -26,10 +26,32 @@ FIRST_LINE_TIMEOUT = 10
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELAY_CMD = "python3 -u %s --relay" % os.path.join(SKILL_DIR, "bridge.py")
 
+# 「不能发」时给手机的一句实话。
+#
+# **别把 shell 命令甩给用户。** 起中继这件事，在电脑上跟那个对话说一句话就行
+# ——「起一下 phone-bridge」会命中 SKILL.md，那边的 agent 自己知道该起中继
+# （SKILL.md 里写了：已经有前端在跑就起中继，没有再起前端）。
+# 用户要的是"接着说"，不是"看懂一条命令行"。
+BLOCKED_NO_RELAY = (
+    "电脑上这个对话正开着，但它那边还没起 phone-bridge。"
+    "在那个对话里跟它说一句「起一下 phone-bridge」，这边就能发了。"
+)
+BLOCKED_NOT_RUNNING = (
+    "这个对话没在跑，手机上只能看。"
+    "在电脑上把它打开，再跟它说一句「起一下 phone-bridge」，就能发了。"
+)
+
 # 「没活进程的对话」怎么发：自己起一个 headless 会话，stdin 就是我们的
 # （不需要进程树资格，见 PORTING.md §1.1）。这是**另起一个脑子**，不是接管；
 # 它是真 agent，会回话、会动工具，所以闲下来要收掉，别攒一堆。
+#
+# **默认关掉了。** 实测下来它不值：语义说不圆（"另起一个脑子"不是"接管"）、
+# 要偷祖先进程的凭据、会跟桌面窗口抢同一份记录、起的还是个会动工具的真 agent，
+# 而它换来的只是"历史对话也能发"这一个边角场景。界面因此只留两类——正在跑且
+# 起了中继的（能发）、正在跑但没起中继的（灰的，提示去那边说一句话）；历史对话
+# 就只读。代码留着，放出来设 PHONE_BRIDGE_ALLOW_SPAWN=1。
 CLAUDE_BIN = os.environ.get("PHONE_BRIDGE_CLAUDE") or shutil.which("claude")
+ALLOW_SPAWN = os.environ.get("PHONE_BRIDGE_ALLOW_SPAWN") == "1"
 SPAWN_IDLE_TTL = 900
 _SPAWNED = {}                       # sid -> {"proc": Popen, "at": 最后一次用的时间}
 _SPAWNED_LOCK = threading.RLock()
@@ -729,7 +751,7 @@ class ClaudeAdapter(Adapter):
     def _route(self, sid):
         """(怎么发, 发到哪, 不能发的原因)。
 
-        三条路，按「离那个对话有多近」排：
+        两条路，按「离那个对话有多近」排：
 
         - `("tree", <会话 socket>)`：我自己就是那个会话的子孙，直接注入。
           只对**前端所在的那一个会话**成立（一个进程只有一个父进程）。
@@ -737,16 +759,19 @@ class ClaudeAdapter(Adapter):
           资格是它的，我借它的手发。这就是「一个端口管住所有会话」的全部秘密：
           前端不需要长出无数个端口，中继也**不占端口**，它只是个 UDS 文件，
           按 sessionId 自动被发现。
-        - `("spawn", None)`：那个对话根本**没在跑**，自起一个 headless 会话
-          直接写它的 stdin（§1.1）。这条对任何历史对话都成立，所以列表里
-          不会再有"点了不能发"的对话。
 
-        **有活进程时绝不走 spawn。** 那种情况下桌面窗口正开着，两边会抢同一份
-        transcript（§10「什么时候会打架」）——用户在看的那一边优先。
+        两条都不成立就是「不能发」，**而且明说原因**：正在跑但没起中继的，让
+        用户去那个对话里说一句话；没在跑的，让他先把它打开。别静默失败——
+        harness 会把帧悄悄丢掉，界面上显示"能发"而消息石沉大海，是这个 skill
+        早期最难查的一个 bug（见 PORTING.md §2）。
+
+        第三条路（自起 headless 会话）默认关掉了，见文件头的 ALLOW_SPAWN。
         """
         pid = _live_claude_procs().get(sid)
         if pid is None:
-            return "spawn", None, None
+            if ALLOW_SPAWN:
+                return "spawn", None, None
+            return None, None, BLOCKED_NOT_RUNNING
         if _can_reach(pid):
             sock_path = os.path.join(SOCKS_DIR, "%d.sock" % pid)
             if os.path.exists(sock_path):
@@ -755,13 +780,14 @@ class ClaudeAdapter(Adapter):
         relay = _relay_for(sid)
         if relay:
             return "relay", relay, None
-        return None, None, (
-            "电脑端正在运行这个对话，但它那边没开 phone-bridge（中继），"
-            "所以手机这边先不给输入框。在那个会话里跑一行就有了： %s" % RELAY_CMD
-        )
+        return None, None, BLOCKED_NO_RELAY
 
     def send_note(self, sid):
-        """能发、但发出去的性质跟普通注入不一样时，给界面一句实话。"""
+        """能发、但发出去的性质跟普通注入不一样时，给界面一句实话。
+
+        只有自起（`ALLOW_SPAWN`，默认关）才不是普通注入，所以平时这里恒返回
+        None——留着是因为那个开关一开，这句话就还得说。
+        """
         kind, _, _ = self._route(sid)
         if kind == "spawn":
             return ("这个对话没在跑：发过去会另起一个 agent 接着聊（它会真的干活）。"

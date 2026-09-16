@@ -69,6 +69,19 @@
   /* 绿 = 在跑且闲着；橙闪 = 在跑且正在干活（想事情 / 跑工具 / 压缩上下文） */
   .dot.busy { background: #ff9f0a; animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
+  /* 能不能发，一个词说清。整行变灰是"那边还没起服务"，不是"坏了"——
+     点进去会说怎么办（去电脑上跟那个对话说一句「起一下 phone-bridge」）。 */
+  li.off { opacity: .5; }
+  .tag {
+    font-size: 11px; padding: 1px 6px; border-radius: 5px;
+    flex: none; white-space: nowrap;
+  }
+  .tag.on   { background: #dff3e3; color: #1f6b33; }
+  .tag.wait { background: #ffeccf; color: #8a5a00; }
+  @media (prefers-color-scheme: dark) {
+    .tag.on   { background: #1c3a24; color: #8fd8a3; }
+    .tag.wait { background: #3d2f14; color: #f0be75; }
+  }
   .row2 {
     font-size: 12px; color: var(--dim); margin-top: 3px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -108,6 +121,16 @@
   .notice {
     padding: 9px 14px; font-size: 12px; color: var(--dim);
     border-top: 1px solid var(--line); text-align: center;
+  }
+  /* 「要做一件事才能发」的那种提示：它不是错误、也不该缩成一行小灰字。
+     写清楚去电脑上干什么，别让用户自己猜。 */
+  .notice.act {
+    text-align: left; font-size: 13px; line-height: 1.5;
+    color: var(--fg); padding: 12px 16px;
+    background: #fff8ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    .notice.act { background: #2a2113; }
   }
   .err { color: var(--warn); }
 
@@ -220,14 +243,14 @@ function shortCwd(c) {
   return parts.slice(-2).join("/");
 }
 
-/* 发不进去的会话，在列表里就把原因摆一行——别让人点进去才发现输入框没了。
-   只在"电脑端真的开着"时标：那是个**状态**问题（在那边起个中继就好），值得单独
-   说一句。codex 那种"这个 App 本来就不能写"是另一回事，80 行都挂同一句话只是
-   噪音，进对话页看一次就够了。 */
-function hint(s) {
-  if (s.can_send) return " · 可发送";
-  if (s.live && s.blocked) return " · " + esc(s.blocked);
-  return "";
+/* 能发不能发，一个词说清。**只在"真的在跑"的会话上标**：历史对话本来就没在跑，
+   点进去看一次就够了；codex 那 80 条更是本来就不能写，每条挂一个「只读」只是
+   噪音。所以这里只分两种——在跑的能发（绿）、在跑的还不能发（橙，整行变灰）。 */
+function stateTag(s) {
+  if (!s.live) return "";
+  return s.can_send
+    ? '<span class="tag on">可发送</span>'
+    : '<span class="tag wait">待启动</span>';
 }
 
 async function api(path, opts) {
@@ -237,7 +260,7 @@ async function api(path, opts) {
   return data;
 }
 
-function setNotice(text, isErr) {
+function setNotice(text, isErr, act) {
   const n = $("notice");
   if (!text) {
     n.style.display = "none";
@@ -246,7 +269,7 @@ function setNotice(text, isErr) {
   }
   n.style.display = "block";
   n.textContent = text;
-  n.className = "notice" + (isErr ? " err" : "");
+  n.className = "notice" + (isErr ? " err" : "") + (act ? " act" : "");
 }
 
 /* ---------- 会话列表 ---------- */
@@ -271,15 +294,17 @@ async function loadSessions() {
       return list;
     }
     ul.innerHTML = list.map((s) => `
-      <li data-app="${esc(s.app)}" data-id="${esc(s.id)}">
+      <li class="${s.live && !s.can_send ? "off" : ""}"
+          data-app="${esc(s.app)}" data-id="${esc(s.id)}">
         <a href="#">
           <div class="row1">
             <span class="badge ${esc(s.app)}">${esc(s.app)}</span>
             ${s.live ? `<span class="dot${s.busy ? " busy" : ""}"></span>` : ""}
             <span class="title">${esc(s.title)}</span>
+            ${stateTag(s)}
           </div>
           <div class="row2">${esc(shortCwd(s.cwd))} · ${esc(ago(s.mtime))}${
-            s.busy ? " · 正在干活…" : ""}${hint(s)}</div>
+            s.busy ? " · 正在干活…" : ""}</div>
         </a>
       </li>`).join("");
     ul.querySelectorAll("li").forEach((li) => {
@@ -395,11 +420,15 @@ async function refreshChat() {
     cur.busy = data.busy;
     $("typing").style.display = data.busy ? "flex" : "none";
     $("composer").style.display = data.can_send ? "flex" : "none";
+    $("chatSub").textContent = [cur.app, shortCwd(cur.cwd),
+      data.can_send ? "可发送" : "不能发"].filter(Boolean).join(" · ");
     // 「能发」有两种性质：注入进一个正在跑的会话，或者**另起一个 agent**。
     // 后者是真的会动工具的，界面得说出来，别让一个蓝泡泡看起来像在跟自己说话。
+    // 「不能发」也要说清**怎么办**，所以那种提示单独用一版显眼的样式（act）。
     setNotice(
       data.can_send ? (data.note || "") : (data.blocked || "这个会话不能发送"),
-      false
+      false,
+      !data.can_send && !!data.blocked
     );
   } catch (e) {
     setNotice(e.message, true);
@@ -428,6 +457,15 @@ async function send() {
 
 /* ---------- 事件 ---------- */
 
+/* 列表自己刷一下。否则你看着一屏灰的、跑去电脑上起了服务、再拿起手机——
+   那一屏还是灰的，像没生效。只在人真的看着列表时刷，5 秒一次不心疼。 */
+function startListPoll() {
+  setInterval(() => {
+    if (document.hidden || cur) return;   // 在对话页或切到后台就不刷
+    loadSessions();
+  }, 5000);
+}
+
 $("backBtn").addEventListener("click", () => {
   clearInterval(pollTimer);
   cur = null;
@@ -450,6 +488,7 @@ $("input").addEventListener("keydown", (e) => {
 /* 手机上切出去再回来，Safari 会重载页面 —— 靠 hash 把对话原样接回来 */
 async function boot() {
   await loadSessions();
+  startListPoll();
   if (IS_FILE) return;
   const parts = decodeURIComponent(location.hash.replace(/^#/, "")).split("/");
   if (parts.length < 2 || !parts[0] || !parts[1]) return;

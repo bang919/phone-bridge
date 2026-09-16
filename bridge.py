@@ -195,8 +195,9 @@ def _watch_session(stop_event):
 def _housekeeping(stop_event):
     """定期让各适配器做家务。
 
-    前端会替"没在跑的历史对话"自起 headless 会话（claude.py 里的 spawn），
-    那些是**真 agent**，不能攒着不收拾——所以要有个人定期来收。
+    目前只有一件事：回收那些还活着的临时进程。claude 的自起功能默认关着
+    （`PHONE_BRIDGE_ALLOW_SPAWN`），关着的时候这里等于空转——但那个开关一开，
+    它拉起的都是**真 agent**，不能攒着不收拾，所以线程照常跑。
     """
     while not stop_event.wait(HOUSEKEEPING_INTERVAL):
         for ad in list(ADAPTERS.values()):
