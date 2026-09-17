@@ -383,8 +383,19 @@ async function loadSessions() {
       html += '<li class="tip">现在没有已启动的对话。' +
         "在电脑上打开一个，跟它说一句「启动 phone-bridge」，它就上来了。</li>";
     }
-    html += can.map(row).join("");
-    html += adsHtml();   // 赞助位卡在两组之间
+    /* 赞助位默认卡在两组之间。但第一组现在动不动五六十条（Codex 一口气能上来
+       几十个），搁在中间等于把广告推到几屏之外，谁也看不见。所以第一组**够五条**
+       就插在第五条下面——露在首屏里，又不至于把首屏占满；不够五条还是留在组间，
+       那本来就是它该在的位置。 */
+    const adBlock = adsHtml();
+    if (can.length >= 5) {
+      html += can.slice(0, 5).map(row).join("");
+      html += adBlock;
+      html += can.slice(5).map(row).join("");
+    } else {
+      html += can.map(row).join("");
+      html += adBlock;
+    }
     if (rest.length) {
       html += '<li class="sec">未启动 phone-bridge · ' + rest.length + "</li>";
       html += rest.map(row).join("");

@@ -32,6 +32,10 @@ WATCH_INTERVAL = 5
 RELAY_TIMEOUT = 15
 HOUSEKEEPING_INTERVAL = 60
 
+# 每个 App 在列表里最多露几条（见 _all_sessions）。**是每个 App 各 10 条**，
+# 不是总共 10 条——两个 App 混排，所以一屏最多 20 条。
+PER_APP_LIMIT = 10
+
 # 赞助位（列表页两组之间那一条）。**内容不在这个文件里**——改 GitHub 上仓库根目录的
 # ads.json 就行，不用碰这台机器，也不用重启。前端每 ADS_TTL 秒去拉一次。
 #
@@ -230,8 +234,12 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 数据 ----------
 
     def _all_sessions(self):
+        # **每个 App 最多 10 条**。手机上要的是"最近在说的那几件事"，不是全部
+        # 历史：Codex 盘上 877 个线程、光最近就 80 条，一屏刷不到头，想找"能说话
+        # 的那个"得翻半天。按最后活动时间取前 N 条，够用。想看更旧的，去电脑上。
         out = []
         for name, ad in ADAPTERS.items():
+            rows = []
             try:
                 for s in ad.sessions():
                     if not s.get("can_send"):
@@ -239,9 +247,11 @@ class Handler(BaseHTTPRequestHandler):
                             s["blocked"] = ad.blocked_reason(s.get("id"))
                         except Exception:
                             s["blocked"] = None
-                    out.append(s)
+                    rows.append(s)
             except Exception as exc:
                 print("[bridge] %s.sessions() 出错: %s" % (name, exc))
+            rows.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+            out.extend(rows[:PER_APP_LIMIT])
         out.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
         return out
 
