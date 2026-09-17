@@ -11,6 +11,7 @@
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -111,22 +112,84 @@ def load_ads():
 
 
 def tailscale_ip():
-    for cand in (
-        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-        "tailscale",
-    ):
+    """Tailscale 那张网卡的 IPv4。没有就返回 None。
+
+    **三个平台的路径都得试。** 早先只写了 macOS 那个 .app 里的二进制，于是
+    Windows 上明明装了、也登录了，照样查不到——直接退回只绑回环，手机连不上，
+    而横幅只说一句"没找到 Tailscale IP"，看不出是这个原因。
+    """
+    cands = [
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",  # macOS 桌面版
+        r"C:\Program Files\Tailscale\tailscale.exe",             # Windows 默认装这儿
+        "/usr/bin/tailscale",                                    # Linux 包管理器
+        "/usr/local/bin/tailscale",
+    ]
+    for name in ("tailscale", "tailscale.exe"):
+        found = shutil.which(name)
+        if found:
+            cands.append(found)
+    for cand in cands:
         try:
             out = subprocess.check_output(
                 [cand, "ip", "-4"],
                 stderr=subprocess.DEVNULL,
                 timeout=5,
             )
-            ip = out.decode().strip().splitlines()[0].strip()
-            if ip:
-                return ip
         except Exception:
             continue
-    return "127.0.0.1"
+        # 多网卡时会连着吐好几行，挑第一个像 IPv4 的
+        for line in out.decode(errors="replace").splitlines():
+            ip = line.strip()
+            if ip and ip.count(".") == 3:
+                return ip
+    return None
+
+
+def lan_ip():
+    """本机在局域网里的 IPv4。没有就返回 None。
+
+    **得问两个来源，单问一个会错。** UDP 路由探测只认默认路由挑出来的那张网卡，
+    而这台机器上装了 Clash（TUN 模式）：默认路由指向那个虚拟网卡，探出来是
+    `198.18.0.1`——代理自己编的地址，手机根本够不着。主机名解析给的才是真网卡
+    （实测这台机器上是 `192.168.10.176`）。两边都收，按"像不像一个正经的局域网
+    地址"排个序再挑。
+
+    那几个 UDP 探测**一个包都不往外发**：UDP 没有握手，`connect` 只是让内核按路由
+    表挑一张网卡、记下源地址，然后问它自己。8.8.8.8 只是借来当个"一定在远端的地
+    址"，没网也照样能挑出默认网卡。
+    """
+    cands = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            cands.append(info[4][0])
+    except Exception:
+        pass
+    for probe in (("8.8.8.8", 80), ("1.1.1.1", 80)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(probe)
+            cands.append(sock.getsockname()[0])
+        except Exception:
+            pass
+        finally:
+            sock.close()
+
+    def rank(ip):
+        """越小越优先；`None` 表示这地址不可能是局域网，扔掉。"""
+        if ip.count(".") != 3 or ip.startswith(("127.", "169.254.", "0.", "255.")):
+            return None
+        if ip.startswith(("198.18.", "198.19.")):   # 基准测试保留段，代理拿它当假地址
+            return None
+        if ip.startswith("192.168."):
+            return 0
+        if ip.startswith("10."):
+            return 1
+        if ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31:
+            return 2
+        return 3                                     # 兜底，含 Tailscale 的 100.64/10
+
+    usable = [c for c in cands if rank(c) is not None]
+    return min(usable, key=rank) if usable else None
 
 
 def get_adapter(name):
@@ -424,10 +487,45 @@ def _qr_png_bytes(matrix, scale=10, quiet=2):
             + chunk(b"IEND", b""))
 
 
+def _ensure_qrcode():
+    """把 `qrcode` 弄到手，拿不到返回 None。
+
+    **不能"没装就算了"。** 用户要的就是"起完给我一张能扫的图"——静悄悄少一张图，
+    在他那边看到的就是"这个功能坏了"，而真正的原因躺在后台任务的日志里，他看不到。
+
+    所以没装就当场装一个（`--user`，装进用户目录，不动系统环境）。装之前会先
+    说一声，不搞小动作。装不上才认输，并且把确切命令打出来——这时候横幅是**明说
+    "二维码没有"**，不是一带而过。
+    """
+    try:
+        import qrcode
+        return qrcode
+    except ImportError:
+        pass
+    print("  [bridge] 没装 `qrcode`，正在装（pip install --user qrcode）…")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "--quiet", "qrcode"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+        import importlib
+        importlib.invalidate_caches()
+        import qrcode
+        return qrcode
+    except Exception as exc:
+        print("  [bridge] 二维码出不来：装不上 `qrcode`（%s）" % exc)
+        print("  [bridge] 自己装一下再重启：%s -m pip install qrcode" % sys.executable)
+        return None
+
+
 def _print_qr(url):
     """把地址画成二维码，手机相机扫一下就进去，不用在手打 IP。
 
     **只给远端地址画**（`127.0.0.1` 是电脑自己连自己用的，手机扫了打不开）。
+    调用方保证传进来的不是回环地址——真的一个远端地址都没有时，横幅会明说
+    "手机连不上"，而不是画一张扫了也没用的码。
 
     颜色是**写死的 ANSI**（白底黑格），不跟着终端主题走：亮主题上默认那套
     会画成"浅底浅格"，暗主题上反过来——两种都有手机扫不出来的时候，而我们
@@ -438,13 +536,10 @@ def _print_qr(url):
     所以真正管用的是那张图——agent 起来之后把它**内嵌进回复**（data URI），
     用户直接在对话里就看到、就能扫。
 
-    `qrcode` 是**可选依赖**：没装就跳过，只提示一句。不为了让屏幕好看，砸掉
-    "clone 下来就能跑"这条。存图那步是纯标准库，只要 `qrcode` 在就一定能存。
+    存图那步是纯标准库，只要 `qrcode` 在就一定存得成。
     """
-    try:
-        import qrcode
-    except ImportError:
-        print("  （想让手机扫码进来：pip install qrcode，重启后这里会显示二维码）")
+    qrcode = _ensure_qrcode()
+    if qrcode is None:
         return
     qr = qrcode.QRCode(border=2)
     qr.add_data(url)
@@ -472,30 +567,12 @@ def main():
     ap.add_argument("--host", default=None,
                     help="绑到指定地址，逗号分隔可以写多个")
     ap.add_argument("--no-tailscale", action="store_true",
-                    help="不自动绑 Tailscale IP，只绑回环")
+                    help="只绑回环：Tailscale 和局域网都不绑")
     ap.add_argument("--relay", nargs="?", const="claude", default=None,
                     metavar="APP",
                     help="中继模式：在当前会话里当一个入站中继（不占端口，"
                          "默认 claude）。要在**那个会话内部**起。")
     args = ap.parse_args()
-
-    if args.host:
-        hosts = [h.strip() for h in args.host.split(",") if h.strip()]
-    elif args.no_tailscale:
-        hosts = ["127.0.0.1"]
-    else:
-        # 默认连 Tailscale IP 一起绑。
-        #
-        # 早先是「默认只绑回环」，理由是暴露给谁该由使用者自己决定。但装这个
-        # Skill 的人多半就是为了让手机连进来，每次都得记得加参数是个错的默认
-        # ——别人装完直接用，才是对的。查不到就退回只绑回环，功能不受影响。
-        hosts = ["127.0.0.1"]
-        ts = tailscale_ip()
-        if ts and ts != "127.0.0.1":
-            hosts.append(ts)
-        else:
-            print("[bridge] 没找到 Tailscale IP，只绑了本机"
-                  "（装了还这样，看它登录没有）")
 
     for ad in load_adapters():
         ADAPTERS[ad.name] = ad
@@ -507,6 +584,29 @@ def main():
 
     if args.relay:
         return run_relay(args.relay)
+
+    # 挑地址放在中继后面：中继不绑端口，跑它之前去探 Tailscale（起子进程 + 超时 5 秒）
+    # 只是白白挡在中继启动前面，而中继是越早起越好的那个。
+    via = ""   # 远端地址是哪来的，横幅上要说清楚
+    if args.host:
+        hosts = [h.strip() for h in args.host.split(",") if h.strip()]
+    elif args.no_tailscale:
+        hosts = ["127.0.0.1"]
+    else:
+        # 默认**一定**绑一个远端地址：先问 Tailscale，没有就退到局域网。
+        #
+        # 早先是「默认只绑回环」，理由是暴露给谁该由使用者自己决定。但装这个
+        # Skill 的人多半就是为了让手机连进来——只绑回环等于装完什么都干不了，
+        # 还得自己去查 IP、改参数。查不到 Tailscale 就整个退回本机，更糟：
+        # 现象是"手机打不开"，横幅上却只说一句"没找到 Tailscale IP"，
+        # 看不出要装东西。远端地址是**承诺**，不能悄悄降级，所以退到局域网，
+        # 并且把代价（同一网络里谁都能开）明写在横幅上。
+        hosts = ["127.0.0.1"]
+        remote, via = tailscale_ip(), "Tailscale"
+        if not remote:
+            remote, via = lan_ip(), "局域网"
+        if remote and remote not in hosts:
+            hosts.append(remote)
 
     servers = []
     for host in hosts:
@@ -527,17 +627,37 @@ def main():
     for host, _ in servers:
         print("    http://%s:%d" % (host, args.port))
     print("  适配器: %s" % ", ".join(sorted(ADAPTERS)))
-    # 二维码只画远端那个地址。回环地址手机扫了打不开，画出来纯是误导。
+
+    # 二维码只画远端那个地址：回环地址手机扫了打不开，画出来纯是误导。
     remote = [h for h, _ in servers if not h.startswith("127.") and h != "::1"]
     if remote:
         _print_qr("http://%s:%d" % (remote[0], args.port))
+        if via and via != "Tailscale":
+            # 退到局域网是**有代价**的，而且代价不小：这个桥没有鉴权。
+            # 既然默认走了这条路，就得当面说清楚，不能让它悄悄发生。
+            print("")
+            print("  注意：上面这个是**局域网**地址（没查到 Tailscale IP）。")
+            print("  同一网络里的任何人都能打开它，而这个桥没有密码。")
+            print("  咖啡馆 / 酒店 / 公司网里别这么用——先装 Tailscale、登录同一")
+            print("  账号再重启，就只在你自己的 tailnet 里可达了：")
+            print("    https://tailscale.com/download")
+    else:
+        # 只有"自己选的"才不啰嗦：`--host` / `--no-tailscale` 是用户明确要只绑回环，
+        # 再警告一遍就是废话。默认路径下走到这里，说明是真没辙了，必须说清楚。
+        if not (args.host or args.no_tailscale):
+            print("")
+            print("  注意：没找到任何远端地址（Tailscale 没有，局域网也没有）——")
+            print("  **手机现在连不上**，只有这台电脑能开 http://127.0.0.1:%d" % args.port)
+            print("  想用手机连：装 Tailscale 并登录同一账号，然后重启本服务。")
+            print("    https://tailscale.com/download")
+
     print("")
-    print("  手机要连进来：上面绑了 Tailscale IP 就用那个，否则看下面几种：")
+    print("  其他连法（想要 HTTPS 域名，或者不想退到局域网）：")
     print("    tailscale serve --bg %d     只在你的 tailnet 内可达，带 HTTPS" % args.port)
     print("    ssh -L %d:127.0.0.1:%d ...  从另一台机器转发过来" % (args.port, args.port))
     print("    ngrok / cloudflared ...      或者任何你惯用的隧道")
     print("    --host <ip>                  直接绑到某个网卡地址（自己注意网络边界）")
-    print("    --no-tailscale               只绑回环，不绑 Tailscale IP")
+    print("    --no-tailscale               只绑回环，Tailscale 和局域网都不绑")
     print("")
     stop_event = threading.Event()
     threading.Thread(
