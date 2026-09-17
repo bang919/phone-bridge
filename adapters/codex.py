@@ -43,6 +43,13 @@ _index_cache = {"at": 0.0, "threads": None}
 _index_lock = threading.Lock()
 _meta_cache = {}
 _title_cache = {}
+_activity_cache = {}
+_activity_lock = threading.Lock()
+
+# 活跃状态只认 Codex 日志自己的生命周期事件。**不要看 mtime 猜**：一轮任务里
+# 日志可能几十秒不落盘，mtime 旧不等于空闲；反过来，回答结束后还会追加 token
+# 统计等收尾记录，mtime 新也不等于仍在干活。
+_ACTIVITY_CHUNK = 128 * 1024
 
 # Codex 会把上下文塞成 role=user。两道判据都要过——**各有各的漏**：
 # `content_item_kinds` 有的消息根本没有（老版本写的不带），
@@ -230,6 +237,123 @@ def _head_meta_cached(path):
     return meta, mtime
 
 
+def _activity_from_line(raw):
+    """从一条 JSONL 里取生命周期状态；不是生命周期事件则返回 None。"""
+    try:
+        entry = json.loads(raw.decode("utf-8", "replace"))
+    except (AttributeError, ValueError):
+        return None
+    if entry.get("type") != "event_msg":
+        return None
+    kind = _payload(entry).get("type")
+    if kind == "task_started":
+        return True
+    if kind in ("task_complete", "turn_aborted"):
+        return False
+    return None
+
+
+def _latest_activity_before(path, end):
+    """从 end 往前倒着扫，返回最近一条生命周期事件的状态。
+
+    rollout 可能很大，不能为了看当前状态重读全文件。每次只倒着读 128 KB，
+    找到第一条 `task_started` / `task_complete` / `turn_aborted` 就停。
+    """
+    if end <= 0:
+        return None
+    carry = b""
+    pos = end
+    try:
+        with open(path, "rb") as fh:
+            while pos > 0:
+                start = max(0, pos - _ACTIVITY_CHUNK)
+                fh.seek(start)
+                data = fh.read(pos - start) + carry
+                pos = start
+                parts = data.split(b"\n")
+                if start > 0:
+                    carry = parts[0]
+                    parts = parts[1:]
+                else:
+                    carry = b""
+                for raw in reversed(parts):
+                    state = _activity_from_line(raw)
+                    if state is not None:
+                        return state
+    except OSError:
+        return None
+    return None
+
+
+def _activity_state(path):
+    """读取某个 rollout 的最新忙碌状态，并按文件增长增量更新。
+
+    首次按尾部倒扫；之后只读新增字节。缓存键是路径，rollout 只追加，因此同尺寸
+    可直接复用。文件被截断或替换成更短的版本时重新初始化。
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+
+    with _activity_lock:
+        hit = _activity_cache.get(path)
+        if hit is None or size < hit["offset"]:
+            pending = b""
+            end = size
+            if size:
+                try:
+                    with open(path, "rb") as fh:
+                        fh.seek(size - 1)
+                        ends_with_newline = fh.read(1) == b"\n"
+                    if not ends_with_newline:
+                        read_from = max(0, size - _ACTIVITY_CHUNK)
+                        with open(path, "rb") as fh:
+                            fh.seek(read_from)
+                            tail = fh.read()
+                        last = tail.rsplit(b"\n", 1)[-1]
+                        try:
+                            json.loads(last.decode("utf-8", "replace"))
+                        except ValueError:
+                            pending = last
+                            end -= len(last)
+                except OSError:
+                    return None
+            busy = _latest_activity_before(path, end)
+            _activity_cache[path] = {
+                "offset": size,
+                "pending": pending,
+                "busy": busy,
+            }
+            return busy
+
+        if size == hit["offset"]:
+            return hit["busy"]
+
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(hit["offset"])
+                data = hit["pending"] + fh.read()
+        except OSError:
+            return hit["busy"]
+
+        if data.endswith(b"\n"):
+            lines = data.split(b"\n")[:-1]
+            pending = b""
+        else:
+            lines = data.split(b"\n")
+            pending = lines.pop() if lines else data
+        busy = hit["busy"]
+        for raw in lines:
+            state = _activity_from_line(raw)
+            if state is not None:
+                busy = state
+        hit["offset"] = size
+        hit["pending"] = pending
+        hit["busy"] = busy
+        return busy
+
+
 def _build_index():
     """扫一遍所有 rollout，按**线程 id** 归并。
 
@@ -268,6 +392,9 @@ def _build_index():
     # 清掉已经不在盘上的文件，别让缓存跟着跑一整天越长越大
     for gone in set(_meta_cache) - live_paths:
         _meta_cache.pop(gone, None)
+    with _activity_lock:
+        for gone in set(_activity_cache) - live_paths:
+            _activity_cache.pop(gone, None)
     return threads
 
 
@@ -323,6 +450,15 @@ class CodexAdapter(Adapter):
 
     # ---------- 接口 ----------
 
+    def _busy(self, t):
+        if not t or not t.get("files"):
+            return None
+        try:
+            path = max(t["files"], key=os.path.getmtime)
+        except (OSError, ValueError):
+            return None
+        return _activity_state(path)
+
     def sessions(self, limit=80):
         threads = _threads()
         out = []
@@ -337,9 +473,13 @@ class CodexAdapter(Adapter):
                 "cwd": t["cwd"] or "",
                 "mtime": t["mtime"],
                 "live": False,
+                "busy": self._busy(t),
                 "can_send": self.can_send(t["id"]),
             })
         return out
+
+    def is_busy(self, sid):
+        return self._busy(_threads().get(sid))
 
     def messages(self, sid, limit=400):
         t = _threads().get(sid)

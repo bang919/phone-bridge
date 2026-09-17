@@ -127,6 +127,11 @@ codex queue --thread <线程 id> --message "正文"
    消息**。所以要按线程把各段拼起来（`_merge_segments`：以最新那份为底往前补，
    只补没出现过的，撞上就停）——只看最新文件的话，用户最常接着聊的会话在手机上
    反而几乎空白。
+3. 忙闲状态看每次任务的 `event_msg.payload.type`：
+   `task_started` = `busy`，`task_complete` / `turn_aborted` = `idle`。
+   **不要用文件 mtime 猜**：任务执行中日志可能几十秒不写，回答结束后又会追加
+   token 统计等收尾记录。适配器从最新 rollout 的尾部倒扫生命周期事件，并按文件
+   增长增量缓存；手机列表的「正在干活…」和详情页输入动画都直接吃这个 `busy`。
 
 能发的是 **Codex 桌面版开的**会话；终端里跑的（`codex-tui` / `codex-cli`）
 app-server 不认识，手机上只能看，点进去会说明原因。

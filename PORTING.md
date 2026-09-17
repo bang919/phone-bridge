@@ -1044,3 +1044,53 @@ Invoke-RestMethod `
 > **通用**：进程间调用会继承启动者的权限。探针和客户端成功只能证明协议通；
 > 正式服务必须从真实运行权限启动，再重跑一次端到端发送。Windows 上尤其要检查
 > 用户目录（`~/.codex`、`~/.claude`）是否在沙箱的写入白名单里。
+
+### 11.7 Codex 手机端缺少忙碌状态（2026-09-17）
+
+Windows 上能读会话、也能发送，但手机列表一直看不到 Codex 的「正在干活…」。
+Claude 有这段提示，是因为 Claude 的会话登记文件里直接带 `status: idle|busy`；
+Codex 适配器当时没有实现 `is_busy()`，继承了基类的 `None`，前端只能显示"不知道"。
+这不是 Windows 特有问题，也不是手机页丢了状态逻辑——[`ui.html`](ui.html) 的列表
+和详情页一直都在根据 `busy` 画提示。
+
+先从两个 rollout 对照生命周期事件：
+
+```powershell
+rg -n '"type":"task_started"|"type":"task_complete"|"type":"turn_aborted"' `
+  "$HOME\.codex\sessions\2026\09\17\rollout-2026-09-17T10-29-27-01a0ad32-9131-7370-89dc-59b1b3f359ca.jsonl" |
+  Select-Object -Last 3
+```
+
+正在执行的那条最后是：
+
+```json
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"01a0aec5-dc35-70e0-a1a4-2169d68bd75c"}}
+```
+
+已经结束的「今天天气如何」最后是：
+
+```json
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"01a0aec3-e08d-7ef3-9016-a01bdb5d08e4"}}
+```
+
+所以判据不是进程，也不是 mtime，而是每个 rollout 最新一条生命周期事件：
+
+| `payload.type` | 状态 |
+|---|---|
+| `task_started` | `busy: true` |
+| `task_complete` | `busy: false` |
+| `turn_aborted` | `busy: false` |
+
+`adapters/codex.py` 现在从最新 rollout 尾部按 128 KB 倒扫第一个生命周期事件，
+找到就停；随后按文件大小和未完成末行增量更新。这样 17 MB 的活动日志也不会每
+5 秒全量重读。macOS 的读取、发送和进程树路径没有改，手机端 UI 也没有改。
+
+重启服务后用同一个 HTTP 接口验证，活动和已结束线程的结果分别是：
+
+```text
+01a0ad32-9131-7370-89dc-59b1b3f359ca  busy=True
+01a0ad7d-e031-7bc2-bc82-eb51eee5b54e  busy=False
+```
+
+> **通用**：日志能证明状态时，优先找明确的开始/结束事件。mtime、进程数量或
+> 输出长度都只能证明"有动静"，不能证明"这一轮已经结束"。
