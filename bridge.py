@@ -36,6 +36,10 @@ HOUSEKEEPING_INTERVAL = 60
 # 不是总共 10 条——两个 App 混排，所以一屏最多 20 条。
 PER_APP_LIMIT = 10
 
+# 启动时把二维码存这儿，给 agent 拿去发给用户（见 _print_qr）。放 /tmp 是因为它
+# 本来就是个一次性的东西：重启一次覆盖一次，重启电脑就没了，不需要收拾。
+QR_PNG_PATH = os.environ.get("PHONE_BRIDGE_QR_PNG") or "/tmp/phone-bridge-qr.png"
+
 # 赞助位（列表页两组之间那一条）。**内容不在这个文件里**——改 GitHub 上仓库根目录的
 # ads.json 就行，不用碰这台机器，也不用重启。前端每 ADS_TTL 秒去拉一次。
 #
@@ -381,6 +385,87 @@ def run_relay(adapter_name):
     return 0
 
 
+def _qr_png_bytes(matrix, scale=10, quiet=2):
+    """把二维码矩阵写成灰度 PNG。**纯标准库**，不引 Pillow / pypng。
+
+    `qrcode` 自带的 `PyPNGImage` 后端看着是"纯 python"，实际它还要额外的
+    `pypng` 包——这台机器上没装，报 ImportError。与其再挂一个大概率也会缺的
+    可选依赖，不如自己拼：PNG 的灰度格式简单到十几行就够，这条路上没有
+    "装没装"这个变量。
+
+    `quiet` 是四周再补几格空白。矩阵自己已经带了 `border=2`，这里补到 4 格
+    ——规范要求的最小静默区。扫码器靠它把码和背景分开。
+    """
+    import struct
+    import zlib
+
+    n = len(matrix)
+    size = (n + quiet * 2) * scale
+    white_row = b"\x00" + b"\xff" * size
+    rows = [white_row] * (quiet * scale)
+    for row in matrix:
+        line = bytearray([0])          # 每行开头的 filter 字节，0 = 不过滤
+        edge = bytes([255]) * (quiet * scale)
+        px = bytearray()
+        for cell in row:
+            px += bytes([0 if cell else 255]) * scale
+        line += edge + bytes(px) + edge
+        rows.extend([bytes(line)] * scale)
+    rows.extend([white_row] * (quiet * scale))
+    raw = b"".join(rows)
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
+def _print_qr(url):
+    """把地址画成二维码，手机相机扫一下就进去，不用在手打 IP。
+
+    **只给远端地址画**（`127.0.0.1` 是电脑自己连自己用的，手机扫了打不开）。
+
+    颜色是**写死的 ANSI**（白底黑格），不跟着终端主题走：亮主题上默认那套
+    会画成"浅底浅格"，暗主题上反过来——两种都有手机扫不出来的时候，而我们
+    猜不到你那边是哪种。写死就没有这个变量。
+
+    **同时存一张 PNG**（下面 QR_PNG_PATH）。终端里这张画得再清楚也没用：
+    服务是 agent 以**后台任务**起的，输出落在任务日志里，用户根本看不到。
+    所以真正管用的是那张图——agent 起来之后把它**内嵌进回复**（data URI），
+    用户直接在对话里就看到、就能扫。
+
+    `qrcode` 是**可选依赖**：没装就跳过，只提示一句。不为了让屏幕好看，砸掉
+    "clone 下来就能跑"这条。存图那步是纯标准库，只要 `qrcode` 在就一定能存。
+    """
+    try:
+        import qrcode
+    except ImportError:
+        print("  （想让手机扫码进来：pip install qrcode，重启后这里会显示二维码）")
+        return
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(url)
+    qr.make()
+    white = "\x1b[47m\x1b[30m"   # 白底 + 黑格
+    reset = "\x1b[0m"
+    print("")
+    print("  手机扫这个（%s）：" % url)
+    for row in qr.get_matrix():
+        # 一格宽用两个字符：终端字符高宽比约 1:2，一格一字符会画成瘦长条
+        line = "".join("██" if cell else "  " for cell in row)
+        print(white + "  " + line + "  " + reset)
+
+    try:
+        with open(QR_PNG_PATH, "wb") as fh:
+            fh.write(_qr_png_bytes(qr.get_matrix()))
+        print("  二维码图片: %s（发给用户，对着屏幕扫）" % QR_PNG_PATH)
+    except Exception as exc:
+        print("  （二维码图片没存成：%s）" % exc)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8971)
@@ -442,6 +527,10 @@ def main():
     for host, _ in servers:
         print("    http://%s:%d" % (host, args.port))
     print("  适配器: %s" % ", ".join(sorted(ADAPTERS)))
+    # 二维码只画远端那个地址。回环地址手机扫了打不开，画出来纯是误导。
+    remote = [h for h, _ in servers if not h.startswith("127.") and h != "::1"]
+    if remote:
+        _print_qr("http://%s:%d" % (remote[0], args.port))
     print("")
     print("  手机要连进来：上面绑了 Tailscale IP 就用那个，否则看下面几种：")
     print("    tailscale serve --bg %d     只在你的 tailnet 内可达，带 HTTPS" % args.port)

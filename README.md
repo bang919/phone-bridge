@@ -4,8 +4,8 @@
 
 ## 怎么用
 
-1. **电脑上**，在 Claude Code 里说一句「启动 phone-bridge」。它会加载这个 skill、把服务跑起来，并打印一个地址。
-2. **手机上**装 [Tailscale](https://tailscale.com/download)，登录**同一个账号**，然后打开那个地址。
+1. **电脑上**，在 Claude Code 里说一句「启动 phone-bridge」。它会加载这个 skill、把服务跑起来，然后把地址和一张二维码发给你——手机扫一下就进去了，不用手打 IP。
+2. **手机上**装 [Tailscale](https://tailscale.com/download)，登录**同一个账号**，然后扫那张码（或打开那个地址）。
 
 就这样。手机上能看到全部对话，也能发消息。
 
@@ -33,6 +33,12 @@ phone-bridge」那一组。其余的整行变灰，点进去会告诉你怎么�
 
 ```bash
 git clone https://github.com/bang919/phone-bridge.git ~/.claude/skills/phone-bridge
+```
+
+只依赖系统自带的 python3。**想要二维码**再装一个（不装也能用，只是没那张图）：
+
+```bash
+pip install qrcode
 ```
 
 ## 更多
