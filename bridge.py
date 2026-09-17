@@ -47,8 +47,13 @@ _ADS_LOCK = threading.Lock()
 
 
 def _clean_ads(raw):
-    """挑出能用的条目。**只收 http(s) 的 url**——它会被塞进 <a href>，
-    一个 `javascript:` 就能在手机上执行脚本，而这份内容来自网络。"""
+    """挑出能用的条目。
+
+    `name` 必须有；`url` **可以没有**——没有就是纯文字一条（"广告位招租，微信…"
+    这种），界面上不画成链接。有的话**只认 http(s)**：它会被塞进 <a href>，
+    一个 `javascript:` 就能在手机上执行脚本，而这份内容来自网络。
+    url 写坏了只丢 url、不丢整条——内容还在，总比整条消失强。
+    """
     out = []
     if not isinstance(raw, list):
         return out
@@ -56,9 +61,11 @@ def _clean_ads(raw):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
-        url = str(item.get("url") or "").strip()
-        if not name or not url.startswith(("http://", "https://")):
+        if not name:
             continue
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            url = ""
         out.append({
             "name": name,
             "desc": str(item.get("desc") or "").strip(),

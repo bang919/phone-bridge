@@ -91,9 +91,15 @@
   ul.sessions li.ads .ad { margin-bottom: 11px; }
   ul.sessions li.ads .ad:last-child { margin-bottom: 0; }
   /* 选择器要压过上面的 `ul.sessions a { display:block; padding:14px }` */
-  ul.sessions li.ads a {
-    display: inline; padding: 0; font-size: 14px; font-weight: 600;
-    color: var(--me); text-decoration: none;
+  ul.sessions li.ads a { padding: 0; text-decoration: none; }
+  ul.sessions li.ads .name { font-size: 14px; font-weight: 600; }
+  /* 有链接的名字才点得动、才是蓝的；没链接的是纯文字，跟正文同色 */
+  ul.sessions li.ads a.name { display: inline; color: var(--me); }
+  /* 网址贴在最下面一行：让用户看得见点的是什么域名，别只给一个名字。
+     字号已经够小，就**别再叠一层透明度**——11px 再半透明，在室外看不清。 */
+  ul.sessions li.ads a.url {
+    display: block; margin-top: 2px; font-size: 11px; color: var(--dim);
+    word-break: break-all;
   }
   ul.sessions li.ads p { margin: 1px 0 0; font-size: 12px; line-height: 1.5; color: var(--dim); }
   .tag {
@@ -279,15 +285,25 @@ function stateTag(s) {
 }
 
 /* 赞助位。内容是服务端给的（原始文件在 GitHub 上，随时能换），这里只负责画。
-   一条都没有就整块不出现——宁可没有广告，也不要一个空框子。 */
+   一条三行：名字、详情、网址。**名字和网址都指向同一个链接**——只给名字的话，
+   用户看不出点进去的是谁家域名。
+   没有 url 的（"广告位招租，微信…"那种）就画成纯文字，不做成链接。
+   一条都没有就整块不出现，宁可没有广告，也不要一个空框子。 */
 function adsHtml() {
-  const ok = ads.filter((a) => /^https?:\/\//i.test(a.url || ""));
+  const ok = ads.filter((a) => (a.name || "").trim());
   if (!ok.length) return "";
-  return '<li class="ads"><div class="ads-label">赞助</div>' + ok.map((a) =>
-    '<div class="ad"><a href="' + escAttr(a.url) + '" target="_blank" ' +
-    'rel="noopener noreferrer">' + esc(a.name) + "</a>" +
-    (a.desc ? "<p>" + esc(a.desc) + "</p>" : "") + "</div>"
-  ).join("") + "</li>";
+  return '<li class="ads"><div class="ads-label">赞助</div>' + ok.map((a) => {
+    const url = /^https?:\/\//i.test(a.url || "") ? a.url : "";
+    const body = (a.desc ? "<p>" + esc(a.desc) + "</p>" : "");
+    if (!url) {
+      return '<div class="ad"><span class="name">' + esc(a.name) +
+        "</span>" + body + "</div>";
+    }
+    const link = 'href="' + escAttr(url) + '" target="_blank" ' +
+                 'rel="noopener noreferrer"';
+    return '<div class="ad"><a class="name" ' + link + ">" + esc(a.name) + "</a>" +
+      body + '<a class="url" ' + link + ">" + esc(url) + "</a></div>";
+  }).join("") + "</li>";
 }
 
 /* 不 await 它：广告慢不该拖住会话列表。拉回来之后重画一次，把赞助位插进去。 */
