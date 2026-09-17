@@ -842,3 +842,205 @@ sessionId。两个写入者在抢**同一份文件**（§1.1 事实 1），必�
 > **通用**：**可见性几乎总能免配置拿到**（注册表、日志、状态文件、socket 目录）；
 > **写入权限才是要花代价的那一半。** 把这两件事拆开设计，别让难的半边
 > 污染简单的半边——也不要用"要不要改配置"去否定整个方案，它只影响其中一条路。
+
+---
+
+## 11. Windows 实测：命名管道 + token（2026-09-17）
+
+这一节记的是 Windows 与 macOS 不同的那条入站边界。结论先写：**Windows 不需要中继。**
+一个不在目标 Claude 会话进程树里的进程，只要拿到该会话的 token，就能直接写它的命名
+管道。实现上按平台分叉，macOS 的 UDS、进程树认证和中继全部保留。
+
+### 11.1 命名管道能发现
+
+命令：
+
+```powershell
+[System.IO.Directory]::GetFiles("\\.\pipe\") | Sort-Object
+```
+
+输出里有：
+
+```text
+\\.\pipe\codex-ipc
+\\.\pipe\LOCAL\cc-msg-<session-hash>
+```
+
+Claude 的会话登记在 `~/.claude/sessions/<pid>.json`。Windows 活动会话会出现
+`messagingSocketPath`，值就是上面的 `\\.\pipe\LOCAL\cc-msg-*`。同一目录还有一份
+`<pid>.<hash>.key`：
+
+```json
+{
+  "peerToken": "<token>",
+  "procStartFt": "134340867377997082",
+  "pidDomain": "win32:<host>"
+}
+```
+
+`procStartFt` / `pidDomain` 用来防止 pid 复用后误用旧 token。`claude.py` 用
+`session.json` 里的 `procStart` / `pidDomain` 校验 `.key`，只把 token 留在内存里，
+不打印、不落盘。
+
+### 11.2 token 能不能让树外进程写进去
+
+用一个隔离的 Claude Code 会话验证，`USERPROFILE` 指到临时目录，并显式给会话一个临时
+命名管道：
+
+```powershell
+$env:USERPROFILE="$PWD\.claude-probe-home"
+python .claude-probe\run_claude_inbox_probe.py
+```
+
+当时会话登记和调试日志显示：
+
+```text
+CLAUDE_PID=9948
+PIPE=\\.\pipe\LOCAL\cc-msg-cafd3978f3b4a35aba58d10380c0d295
+[uds-messaging] Listening: \\.\pipe\LOCAL\cc-msg-cafd3978f3b4a35aba58d10380c0d295
+[uds-messaging] Inject messages (auth line REQUIRED here; a pipe is not reachable via socat/AF_UNIX)
+```
+
+随后用一个独立 Python 进程调用适配器，不把它放进 Claude 会话的进程树：
+
+```powershell
+$env:USERPROFILE="$PWD\.claude-probe-home"
+python -c "from adapters.claude import ClaudeAdapter; ad=ClaudeAdapter(); print(ad.send('22222222-3333-4444-8555-666666666666', 'WINDOWS_ADAPTER_E2E_20260917_B'))"
+```
+
+原始返回：
+
+```text
+{'ok': True, 'via': 'windows-pipe'}
+```
+
+Claude 自己记下的是：
+
+```text
+[uds-messaging] Routed user message to queue (priority=next):
+<cross-session-message from-name="phone-bridge">
+WINDOWS_ADAPTER_E2E_20260917_B
+```
+
+再从适配器读回：
+
+```text
+{'role': 'user', 'text': 'WINDOWS_ADAPTER_E2E_20260917_B', 'via': 'peer', 'i': 4}
+```
+
+这组对照回答的是关键问题：**不是“管道连上了”，而是消息真的被会话接收并写进日志。**
+Windows 上 token 代表了入站资格，进程树不是判据。因此 bridge 可以直接服务多个活动
+Claude 会话，不需要每个会话再起一个中继。
+
+> 验证时发现，Codex 自带沙箱里的命名管道访问会返回 `EPERM`，官方 Node 客户端也一样。
+> 同一操作在普通 Windows 进程里成功。实际运行 `bridge.py` 时要用普通终端，不要放进
+> 这个沙箱。
+
+### 11.3 Codex 的门还在
+
+Windows 上的 Codex 桌面版自带 CLI，`queue` 子命令没有消失：
+
+```powershell
+$c = (Get-Command codex).Source
+& $c --version
+& $c queue --help
+```
+
+输出：
+
+```text
+C:\Users\onwar\AppData\Local\OpenAI\Codex\bin\<build>\codex.exe
+codex-cli 0.155.0-alpha.2.6
+Queue a message for an existing session
+Usage: codex queue [OPTIONS] --thread <THREAD> --message <TEXT>
+```
+
+用一个临时线程实发后返回：
+
+```text
+Queued message 01a0ad60-ec6a-77d0-ba09-bb8a0f816592 for thread 01a0ad60-74cb-7450-bd14-50758767bac4
+```
+
+临时线程随后用 `codex delete --force` 删除。结论是 Codex 继续调用官方 `queue`，
+不自己连 `\\.\pipe\codex-ipc`，也不改 Codex 的持久配置。
+
+### 11.4 平台分叉点
+
+- `adapters/claude.py`：Windows 从会话登记和 `.key` 读取管道/token，发送两行
+  `auth` + `user`；macOS 原路径不变。
+- `adapters/codex.py`：Windows 发现官方 `codex.exe`，调用 `queue`；macOS 继续使用
+  ChatGPT.app 自带二进制。
+- `bridge.py`：Windows 二维码写到系统临时目录，Tailscale 使用 Windows 安装路径，
+  不套 launchd reparent 判据，`--relay` 直接提示不需要中继。
+
+### 11.5 Windows 启动链复盘（2026-09-17）
+
+Windows 上首次实测又暴露了两个不属于"端口能不能通"的问题：
+
+- Tailscale 在 `D:\system_app\Tailscale\tailscale.exe` 运行，但 CLI 访问
+  `\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled` 被拒绝，返回
+  `Access is denied`，所以 `tailscale ip -4` 失败。适配器不能据此判断 Tailscale
+  不存在；CLI 失败后还要扫描本机 IPv4，并从 `100.64.0.0/10` 段识别 Tailscale
+  地址。实测拿到 `100.118.186.23`。
+- `qrcode` 自动安装确实被执行，但受限进程访问不到包源，pip 返回
+  `No matching distribution found for qrcode`。旧实现把 stderr 丢掉，用户只看到
+  `No module named 'qrcode'`。现在保留 pip 最后一行错误，并在普通网络环境下允许
+  `pip install --user qrcode` 成功。
+
+这两条说明：启动成功后还要验证三个信号——**绑定的远端地址、实际生成的二维码文件、
+以及 `/api/sessions` 返回的正常响应**。只检查进程没退出不够。
+
+### 11.6 启动权限会沿发送链传递（2026-09-17）
+
+Windows 的 Claude 管道探针和 Codex `queue` 都在普通权限下成功，但把 `bridge.py`
+放进 Codex 工具沙箱后，Codex 发送失败。手机端看到的原始错误是：
+
+```text
+WARNING: failed to clean up stale arg0 temp dirs: 拒绝访问。 (os error 5)
+WARNING: proceeding, even though we could not create PATH aliases: 拒绝访问。 (os error 5)
+Error: failed to initialize state database:
+failed to initialize sqlite local db at C:\Users\onwar\.codex\state_5.sqlite:
+attempt to write a readonly database
+```
+
+原因不是 `queue` 子命令或线程 ID，而是 `bridge.py` 从受限沙箱启动后，
+`subprocess` 生成的 `codex.exe` 继承了同一套文件系统限制。它连读取 Codex
+状态库都失败，因此消息根本没进入 app-server。修正方式是停止沙箱里的服务，
+改从普通 Windows 用户进程启动：
+
+```powershell
+python bridge.py --port 8971
+```
+
+再用同一个 HTTP 入口发送：
+
+```powershell
+$body = @{
+  app = "codex"
+  sid = "01a0ad7d-e031-7bc2-bc82-eb51eee5b54e"
+  text = "我说的是佛山和深圳！"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8971/api/send" `
+  -Method Post `
+  -ContentType "application/json; charset=utf-8" `
+  -Body $body
+```
+
+普通权限下返回：
+
+```json
+{
+  "ok": true,
+  "via": "codex queue",
+  "detail": "Queued message 01a0ad97-aa96-7152-8ced-c4c2a43ec99b for thread 01a0ad7d-e031-7bc2-bc82-eb51eee5b54e."
+}
+```
+
+随后 `/api/messages` 能看到用户消息和 Codex 的回复，证明修复不是只看退出码，
+而是端到端落盘成功。
+
+> **通用**：进程间调用会继承启动者的权限。探针和客户端成功只能证明协议通；
+> 正式服务必须从真实运行权限启动，再重跑一次端到端发送。Windows 上尤其要检查
+> 用户目录（`~/.codex`、`~/.claude`）是否在沙箱的写入白名单里。

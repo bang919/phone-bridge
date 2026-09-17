@@ -9,12 +9,14 @@
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -37,9 +39,13 @@ HOUSEKEEPING_INTERVAL = 60
 # 不是总共 10 条——两个 App 混排，所以一屏最多 20 条。
 PER_APP_LIMIT = 10
 
-# 启动时把二维码存这儿，给 agent 拿去发给用户（见 _print_qr）。放 /tmp 是因为它
-# 本来就是个一次性的东西：重启一次覆盖一次，重启电脑就没了，不需要收拾。
-QR_PNG_PATH = os.environ.get("PHONE_BRIDGE_QR_PNG") or "/tmp/phone-bridge-qr.png"
+# 启动时把二维码存这儿，给 agent 拿去发给用户（见 _print_qr）。放临时目录是因为
+# 它本来就是个一次性的东西：重启一次覆盖一次，重启电脑就没了，不需要收拾。
+_DEFAULT_QR_PNG = (
+    os.path.join(tempfile.gettempdir(), "phone-bridge-qr.png")
+    if os.name == "nt" else "/tmp/phone-bridge-qr.png"
+)
+QR_PNG_PATH = os.environ.get("PHONE_BRIDGE_QR_PNG") or _DEFAULT_QR_PNG
 
 # 赞助位（列表页两组之间那一条）。**内容不在这个文件里**——改 GitHub 上仓库根目录的
 # ads.json 就行，不用碰这台机器，也不用重启。前端每 ADS_TTL 秒去拉一次。
@@ -120,10 +126,22 @@ def tailscale_ip():
     """
     cands = [
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",  # macOS 桌面版
-        r"C:\Program Files\Tailscale\tailscale.exe",             # Windows 默认装这儿
         "/usr/bin/tailscale",                                    # Linux 包管理器
         "/usr/local/bin/tailscale",
     ]
+    if os.name == "nt":
+        # 默认安装目录；也覆盖用户改了 ProgramFiles / 装到用户目录的情况。
+        cands.extend((
+            os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "Tailscale", "tailscale.exe",
+            ),
+            os.path.join(
+                os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                "Tailscale", "tailscale.exe",
+            ),
+            os.path.expandvars(r"%LOCALAPPDATA%\Tailscale\tailscale.exe"),
+        ))
     for name in ("tailscale", "tailscale.exe"):
         found = shutil.which(name)
         if found:
@@ -142,6 +160,23 @@ def tailscale_ip():
             ip = line.strip()
             if ip and ip.count(".") == 3:
                 return ip
+
+    # Windows 的 tailscaled 用受保护的命名管道，普通权限进程调用
+    # `tailscale ip -4` 可能直接被拒绝。网卡地址仍然能通过本机 DNS
+    # 解析拿到，所以 CLI 失败时再按 Tailscale 的 100.64.0.0/10 段找一次。
+    try:
+        addresses = {
+            info[4][0]
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        }
+    except Exception:
+        return None
+    for ip in sorted(addresses):
+        try:
+            if ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"):
+                return ip
+        except ValueError:
+            continue
     return None
 
 
@@ -330,6 +365,10 @@ def _watch_session(stop_event):
     跑下去（这个坑踩过——一个被 nohup 起的 bridge 在启动者消失后还活着）。
     所以得自己盯：发现被收养了就说明会话结束了，自己了断。
     """
+    if os.name == "nt":
+        # Windows 没有 launchd 那种 reparent；父 pid 也可能在服务启动后立刻变化。
+        # 前台服务只由自己退出/被打断来结束，别拿父进程关系误杀它。
+        return
     start_ppid = os.getppid()
     if start_ppid == 1:
         print("[bridge] 警告：启动时父进程就是 launchd（孤儿）")
@@ -397,6 +436,9 @@ def run_relay(adapter_name):
     必须**从那个会话内部**起（在那边以后台任务方式跑这条命令），否则它
     自己就不在会话的树里，中继等于白起。
     """
+    if os.name == "nt":
+        print("[relay] Windows 通过命名管道 + token 直接发送，不需要中继")
+        return 0
     ad = get_adapter(adapter_name)
     relay_dir = getattr(ad, "relay_dir", None)
     if not relay_dir:
@@ -504,12 +546,20 @@ def _ensure_qrcode():
         pass
     print("  [bridge] 没装 `qrcode`，正在装（pip install --user qrcode）…")
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--user", "--quiet", "qrcode"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=120,
         )
+        if proc.returncode:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            if detail:
+                print("  [bridge] pip: %s" % detail[-1])
+            else:
+                print("  [bridge] pip 退出码：%d" % proc.returncode)
+            raise RuntimeError("pip install 返回 %d" % proc.returncode)
         import importlib
         importlib.invalidate_caches()
         import qrcode
@@ -548,10 +598,11 @@ def _print_qr(url):
     reset = "\x1b[0m"
     print("")
     print("  手机扫这个（%s）：" % url)
-    for row in qr.get_matrix():
-        # 一格宽用两个字符：终端字符高宽比约 1:2，一格一字符会画成瘦长条
-        line = "".join("██" if cell else "  " for cell in row)
-        print(white + "  " + line + "  " + reset)
+    if os.name != "nt":
+        for row in qr.get_matrix():
+            # 一格宽用两个字符：终端字符高宽比约 1:2，一格一字符会画成瘦长条
+            line = "".join("██" if cell else "  " for cell in row)
+            print(white + "  " + line + "  " + reset)
 
     try:
         with open(QR_PNG_PATH, "wb") as fh:

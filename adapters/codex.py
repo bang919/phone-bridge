@@ -13,6 +13,7 @@
 import glob
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -22,10 +23,12 @@ from .base import Adapter, text_from_content
 ROOT = os.path.expanduser("~/.codex/sessions")
 GLOB = os.path.join(ROOT, "*", "*", "*", "rollout-*.jsonl")
 
-# **刻意不用 PATH 里那个 codex。** PATH 上是 0.151.0，App 实际跑的是
-# 0.154.0-alpha——而 ipc.sock 认的是对端身份，发命令的必须是这个 App 自己的
-# 二进制。用 PATH 那个要么被拒，要么跟正在跑的 app-server 说不到一块去。
-CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex"
+# **macOS 刻意不用 PATH 里那个 codex。** PATH 上版本可能跟 App 实际跑的不一致，
+# 而 ipc.sock 认的是对端身份，发命令的必须是这个 App 自己的二进制。Windows
+# 的命名管道由官方 CLI 处理，优先使用 PATH / LocalAppData 里可运行的版本。
+MAC_CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex"
+IS_WINDOWS = os.name == "nt"
+_codex_bin_cache = {"path": None}
 
 # 列表每 5 秒轮询一次，所以要跟得上——但扫全部 rollout 的头一行要 0.3 秒，
 # 每回都重扫就是白烧 CPU（实测 /api/sessions 会到 0.87 秒）。
@@ -57,9 +60,41 @@ _INJECTED_PREFIXES = (
 _HIDDEN_THREAD_SOURCES = ("subagent", "guardian_review")
 
 
+def _codex_bin():
+    if _codex_bin_cache["path"]:
+        return _codex_bin_cache["path"]
+    override = os.environ.get("PHONE_BRIDGE_CODEX")
+    if override:
+        _codex_bin_cache["path"] = override
+        return override
+    if not IS_WINDOWS:
+        _codex_bin_cache["path"] = MAC_CODEX_BIN
+        return MAC_CODEX_BIN
+
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        hits = glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe"))
+        if hits:
+            _codex_bin_cache["path"] = max(hits, key=os.path.getmtime)
+            return _codex_bin_cache["path"]
+    hit = shutil.which("codex")
+    if hit:
+        _codex_bin_cache["path"] = hit
+        return hit
+
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    hits = glob.glob(os.path.join(
+        pf, "WindowsApps", "OpenAI.Codex_*", "app", "resources", "codex.exe"
+    ))
+    if hits:
+        _codex_bin_cache["path"] = max(hits, key=os.path.getmtime)
+        return _codex_bin_cache["path"]
+    return None
+
+
 def _iter_jsonl(path, max_lines=None):
     try:
-        with open(path, errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
                 if max_lines is not None and i >= max_lines:
                     return
@@ -328,7 +363,12 @@ class CodexAdapter(Adapter):
         （见 send_note，界面上会说明）。
         """
         t = _threads().get(sid)
-        return bool(t) and t.get("originator") == "Codex Desktop"
+        if not t:
+            return False
+        originator = t.get("originator")
+        if IS_WINDOWS:
+            return originator in ("codex_work_desktop", "Codex Desktop")
+        return originator == "Codex Desktop"
 
     def blocked_reason(self, sid):
         if self.can_send(sid):
@@ -351,12 +391,17 @@ class CodexAdapter(Adapter):
     def send(self, sid, text):
         if not self.can_send(sid):
             raise RuntimeError(self.blocked_reason(sid) or "发不了")
-        if not os.path.exists(CODEX_BIN):
-            raise RuntimeError("找不到 Codex 桌面版自带的 codex：%s" % CODEX_BIN)
+        codex_bin = _codex_bin()
+        if not codex_bin or not os.path.exists(codex_bin):
+            raise RuntimeError("找不到可用的 codex 可执行文件（可用 PHONE_BRIDGE_CODEX 指定）")
+        run_kwargs = {}
+        if IS_WINDOWS:
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             proc = subprocess.run(
-                [CODEX_BIN, "queue", "--thread", sid, "--message", text],
+                [codex_bin, "queue", "--thread", sid, "--message", text],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
+                **run_kwargs
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("Codex 20 秒没回应，这条可能没发出去")
@@ -367,6 +412,14 @@ class CodexAdapter(Adapter):
         # 退出码和输出都要看：它失败时是把 JSON-RPC 的错误原样打出来，
         # 光看退出码会漏。成功就一行 "Queued message <id> for thread <id>."
         if proc.returncode != 0 or "Queued message" not in out:
-            raise RuntimeError("Codex 没收下这条：%s"
-                               % (err or out or "退出码 %d" % proc.returncode))
+            detail = err or out or "退出码 %d" % proc.returncode
+            if "state_5.sqlite" in detail and (
+                "readonly database" in detail.lower() or "只读" in detail
+            ):
+                detail += (
+                    "\n这通常是 phone-bridge 从受限沙箱启动，导致 codex 子进程"
+                    "无法写 ~/.codex/state_5.sqlite。请从普通 PowerShell / 终端"
+                    "重新启动 bridge 后再试。"
+                )
+            raise RuntimeError("Codex 没收下这条：%s" % detail)
         return {"ok": True, "via": "codex queue", "detail": out}

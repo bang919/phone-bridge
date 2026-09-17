@@ -22,11 +22,18 @@ bridge.py  ← HTTP 服务，默认绑 127.0.0.1 + Tailscale IP（没有就用�
 
 | App | 出站（读） | 入站（写） |
 |---|---|---|
-| `claude` | `~/.claude/projects/*/*.jsonl` | `/tmp/cc-socks/<pid>.sock`（UDS 注入） |
+| `claude` | `~/.claude/projects/*/*.jsonl` | macOS：`/tmp/cc-socks/<pid>.sock`（UDS 注入）；Windows：`\\.\pipe\LOCAL\cc-msg-*`（先发 auth token，再发消息） |
 | `codex` | `~/.codex/sessions/*/*/*/rollout-*.jsonl` | `codex queue --thread <id> --message <text>` |
 
-**两个 App 的入站机制完全不一样**，下面那套"中继 / 进程树"只适用于 claude。
-Codex 走它自己的 `queue`，不需要中继，也不需要进程树资格。
+**两个 App、两个平台，入站机制都不一样**：
+
+- macOS 的 Claude 走 UDS 和**进程树**认证。别的会话要能写，必须在该会话里放中继。
+- Windows 的 Claude 走**命名管道 + token**。实测一个不在会话进程树里的进程，只要
+  拿到 `~/.claude/sessions/<pid>.*.key` 里的 token，就能直接写入该会话，**不需要中继**。
+- Codex 在两个平台都走官方 `queue`，不需要中继，也不需要进程树资格。
+
+下面所有"中继 / 进程树"段落，除特别说明外都是 **macOS 的现有行为**。Windows 会按
+平台分叉绕开这一整套，不要为了 Windows 去删 macOS 中继代码。
 
 ### 一个 bridge 管所有会话，一个端口就够
 
@@ -128,6 +135,9 @@ app-server 不认识，手机上只能看，点进去会说明原因。
 
 ### 先分清：用户要你起的是**前端**还是**中继**
 
+> **Windows：没有中继。** 直接起前端即可；`python bridge.py --relay` 在 Windows 会
+> 说明不需要中继并正常退出。下面的前端/中继分流只适用于 macOS。
+
 听到「启动 phone-bridge」时，先看一眼这台机器上有没有前端在跑：
 
 ```bash
@@ -147,6 +157,11 @@ lsof -nP -iTCP:8971 -sTCP:LISTEN
 前端，那个会话照样「不能发」。
 
 ### 起前端
+
+> **Windows 先看运行环境。** bridge 必须从**普通用户进程**启动。如果把它放进
+> 受限工具沙箱，它调用 `codex queue` 时子进程也继承限制，无法写
+> `~/.codex/state_5.sqlite`，手机发送会报 `attempt to write a readonly
+> database`。Windows 没有 macOS 那样的进程树要求，权限边界就是这里的全部关键。
 
 **这一步错了整个入站就是废的，而且不会报错。**
 
@@ -204,7 +219,14 @@ done
 图一定在；真装不上也会明说"二维码出不来"并给出命令，不会安静地少一张图。
 重启一次覆盖一次，不用收拾。
 
+自动安装需要当前 Python 能访问包源。受限环境里 pip 可能报
+`No matching distribution found for qrcode`；这时要保留并转达 pip 的最后一行错误，
+不能只显示 `No module named 'qrcode'`，否则看起来像代码没尝试安装。
+
 ### 中继：让**别的**会话也能写（`--relay`，不占端口）
+
+> **这一段只适用于 macOS。** Windows 的命名管道写权限靠 token，不靠进程树，所以
+> 一个前端进程就能管所有支持 peer messaging 的活动 Claude 会话。
 
 前端只能写它自己出生的那一个会话。想让别的会话也能从手机写进去，就在
 **那个会话里**起一个中继——同样必须从会话内部起，自查方法一样：
@@ -279,11 +301,16 @@ harness 会把凭据从**所有子进程**的环境里剥干净（实测：前�
 
 先绑回环，再把挑中的那个一起绑上。
 
-查 Tailscale 会依次试 macOS 的 `/Applications/Tailscale.app/…`、Windows 的
-`C:\Program Files\Tailscale\tailscale.exe`、Linux 的 `/usr/bin/tailscale`，再加 PATH 上的
-`tailscale`。**只写 macOS 那条路是错的**——Windows 上装了、登录了也照样查不到，
-然后就没有远端地址、也就没有二维码，而横幅只说一句"没找到 Tailscale IP"，
-看不出是这个原因（Windows 上就是这么翻的车）。
+查 Tailscale 会依次试 macOS 的 `/Applications/Tailscale.app/…`；Windows 的
+`Program Files` / `Program Files (x86)` / 用户安装目录；Linux 的 `/usr/bin` 和
+`/usr/local/bin`；最后再找 PATH 上的 `tailscale`。**只写 macOS 那条路是错的**——
+Windows 上装了、登录了也照样查不到，然后就没有远端地址、也就没有二维码，而横幅
+只说一句"没找到 Tailscale IP"，看不出是这个原因（Windows 上就是这么翻的车）。
+
+Windows 还可能遇到第二层权限问题：`tailscaled` 的本地 API 是受保护的命名管道，
+普通进程调用 `tailscale ip -4` 会返回 `Access is denied`。这时不能把命令失败当成
+"没有 Tailscale"，还要从本机 IPv4 地址里找 `100.64.0.0/10` 网段；实测这样能拿到
+`100.118.186.23`，而 Tailscale 本身确实在运行。
 
 局域网那条也不是白捡的：**这个桥没有鉴权**，能打开那个地址的人就能往你的 AI 会话里
 发消息。所以退到局域网时横幅会明说，别在咖啡馆 / 酒店 / 公司网里这么用。
@@ -403,32 +430,33 @@ harness 会把正文抽出来存进 `origin.body`（干净），但**它不会�
 
 ## 已知限制
 
-- **claude 入站靠进程树关系认证**，必须是会话的子孙进程。`can_send()` 会真的去查
-  祖先链，查不到就返回 `False` 并在界面上说明原因——**不会假装能发**。
+- **macOS 的 claude 入站靠进程树关系认证**，必须是会话的子孙进程。`can_send()` 会
+  真的去查祖先链，查不到就返回 `False` 并在界面上说明原因——**不会假装能发**。
+  这也意味着一个前端只能直接写它出生的那一个会话，别的会话必须放中继。
   踩过的坑：早先 `can_send` 只检查 socket 文件在不在，结果界面上显示「可发送」，
   消息却全被丢掉。别再退回那种写法。
-- **只能注入 bridge 所属的那一个会话。** 别的 claude 会话不在同一进程树里，
-  `can_send` 会返回 `False`。
-  这是 harness 的判定（`chain.includes(process.pid)`，源码见
-  [`PORTING.md`](PORTING.md) §2.3），不是我们写死的限制。想管多个会话，就在
-  别的会话里放个中继（harness 自己就考虑了这种形态）——手机上会告诉用户去
-  那边说一句「启动 phone-bridge」。
+- **Windows 的 claude 入站靠命名管道 + token，不查发信人的进程树。** 因此一个前端
+  可以直接写所有有活动进程、有管道、有 token 的 Claude 会话，不需要中继。没有活动
+  进程的历史对话仍然只能看。
 - **codex 反过来：跟窗口开没开无关。** 只要是桌面版开的会话，窗口关着也能发
   ——`queue` 会把它拉起来跑一轮。所以 Codex 的 `can_send` 不看"在不在跑"，
   看的是"**是不是桌面版开的**"（终端里跑的 app-server 不认识，接不进去）。
   代价是发出去**真的会跑一轮**（会思考、会动工具），界面上有一句话说明这件事
   ——不是往一条死记录里追加。
 - **没在跑的对话只能看。** 原来有一条"自己起一个 headless 会话"的路，默认关掉了
-  （`PHONE_BRIDGE_ALLOW_SPAWN=1` 才开），理由见「架构」那张表的注。所以手机上
-  能发的会话 = **此刻在电脑上开着、并且起了中继的**那些。关掉对话**窗口**不影响
-  （进程还活着），**退出 Claude 桌面 App 或重启电脑**才会全部变回只读。
-- **bridge 随会话生死。** 进程树上有盯梢的（`_watch_session`）：父进程一没，
+  （`PHONE_BRIDGE_ALLOW_SPAWN=1` 才开），理由见「架构」那张表的注。手机上能发的
+  Claude 会话：macOS 是**此刻在电脑上开着、并且起了中继的**那些；Windows 是**有活动
+  进程、有命名管道、有可用 token 的**那些。关掉对话**窗口**不影响（进程还活着），
+  **退出 Claude 桌面 App 或重启电脑**才会全部变回只读。
+- **macOS 的 bridge 随会话生死。** 进程树上有盯梢的（`_watch_session`）：父进程一没，
   它就被 launchd 收养，盯梢的发现这一点后**自己退出**。所以不需要你手动收尾，
-  会话结束它就跟着走。会话重启后要重新起。
+  会话结束它就跟着走。会话重启后要重新起。Windows 没有 launchd 式 reparent 判据，
+  服务在前台时用 `Ctrl+C` 关闭。
   （这个坑踩过：子进程**不会**随父进程一起死。一个用 `nohup &` 起的 bridge
   在启动者消失之后还活着，一直在听端口。别退回没有盯梢的版本。）
-- UDS 是 Claude Code 的内部协议，**非公开 API**，版本升级可能失效。
-  失效时表现为「连得上但没反应」，先按上面的祖先链自查。
+- UDS（macOS）和 peer 命名管道（Windows）都是 Claude Code 的内部协议，**非公开 API**，
+  版本升级可能失效。macOS 失效时先按祖先链自查；Windows 失效时检查会话登记里有没有
+  `messagingSocketPath`，以及同目录的 `.key` 文件里有没有匹配 `procStart` 的 token。
 - **bridge 没有鉴权。** 能访问这个端口的人就能往你的 AI 会话里发消息。
   所以默认只绑回环 + Tailscale IP；退到局域网那档横幅会明说（同一个网络里谁都能
   打开）。别绑 `0.0.0.0`，也别加 `Access-Control-Allow-Origin: *`（那等于让任意
@@ -527,6 +555,10 @@ harness 会把正文抽出来存进 `origin.body`（干净），但**它不会�
 
 ## 怎么关掉
 
+> **Windows：** 没有 macOS 的 launchd reparent 判据，bridge 不会因为父进程变化而
+> 自动退出。前台运行时用 `Ctrl+C`；如果把它放到了后台，就在任务管理器里结束对应的
+> Python 进程。下面是 macOS 的行为。
+
 **自己会关的情况只有一个：退出 Claude 桌面 App。**
 
 链路是 `bridge → claude 会话 → disclaimer → Claude.app`。App 一退，链断，bridge
@@ -595,4 +627,24 @@ while [ "$pid" != "1" ] && [ -n "$pid" ]; do
   pid=$(ps -o ppid= -p "$pid" | tr -d ' ')
 done
 ```
+
+### Windows：`readonly database`
+
+如果手机发送后看到：
+
+```text
+failed to initialize state database:
+failed to initialize sqlite local db at C:\Users\<用户>\.codex\state_5.sqlite:
+attempt to write a readonly database
+```
+
+先检查 bridge 是从哪里启动的。**从受限工具沙箱启动的 Python 进程，会把这个限制
+传给 `codex queue`。** 退出当前 bridge，在普通 PowerShell / 终端里重新启动：
+
+```powershell
+python bridge.py --port 8971
+```
+
+然后重新发送。实测普通权限启动后 `codex queue` 返回
+`Queued message ... for thread ...`，消息会落进对应 rollout，Codex 也会正常回复。
 

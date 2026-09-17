@@ -4,7 +4,19 @@
 
 ## 怎么用
 
-1. **电脑上**，在 Claude Code 里说一句「启动 phone-bridge」。它会加载这个 skill、把服务跑起来，然后把地址和一张二维码发给你——手机扫一下就进去了，不用手打 IP。
+1. **电脑上**启动 `bridge.py`。在 Claude Code 里说一句「启动 phone-bridge」也可以，或者直接运行：
+
+   ```bash
+   python bridge.py --port 8971
+   ```
+
+   服务会把地址打印出来；缺 `qrcode` 会自动安装，并生成一张二维码图片。
+
+   > **Windows 必须从普通 PowerShell / 终端启动。** 如果从受限工具沙箱启动，
+   > `bridge.py` 调用 `codex queue` 时会继承写入限制，手机发送报
+   > `state_5.sqlite ... readonly database`。这不是 Codex 会话坏了，换到普通
+   > 终端重启 bridge 即可。
+
 2. **手机上**装 [Tailscale](https://tailscale.com/download)，登录**同一个账号**，然后扫那张码（或打开那个地址）。
 
 就这样。手机上能看到全部对话，也能发消息。
@@ -25,14 +37,18 @@ Codex 只有**桌面版开的**会话能发（终端里跑的接不进去）。�
 
 ## 注意
 
-- **只在 macOS 上能用。** 依赖 Claude 桌面版自己的进程布局。
+- **macOS 和 Windows 都支持。**
+  - macOS 的 Claude 入站走 UDS，并受会话进程树认证；别的会话需要启动中继。
+  - Windows 的 Claude 入站走命名管道，用会话自己的 token 认证；拿得到 token 的 bridge
+    可以直接写入所有支持 peer messaging 的活动会话，**不需要中继**。
+  - Codex 在两个平台都走桌面版自带的 `codex queue`。
 - 手机上发的话**不算你的「批准」**。日常接着聊没问题；涉及危险操作、边界、权限的，别指望手机上这一句能通过。
 - 服务**没有密码**，所以优先走 Tailscale 内网。没装 Tailscale 时会退到局域网地址
   （同一个 wifi 下谁都能开）——**别往公网暴露**。
 
-手机上只有**正在跑、并且起了服务**的对话能发——列表里它们在「已启动
-phone-bridge」那一组。其余的整行变灰，点进去会告诉你怎么办：**在电脑上打开那个
-对话，跟它说一句「启动 phone-bridge」**。出门前先把它启动好就行。
+macOS 上，Claude 只有**正在跑、并且起了中继**的对话能发；点灰掉的会话会提示在
+对应对话里启动 phone-bridge。Windows 上 Claude 有活动进程、管道和 token 就能发，
+不需要逐个启动中继。没在跑的历史对话在两个平台都只能看。
 
 ## 安装
 

@@ -20,6 +20,7 @@ from .base import Adapter, text_from_content
 ROOT = os.path.expanduser("~/.claude/projects")
 SOCKS_DIR = "/tmp/cc-socks"
 FIRST_LINE_TIMEOUT = 10
+IS_WINDOWS = os.name == "nt"
 
 # 这份 skill 自己的绝对路径。给别的会话的提示里必须用它——那个会话的
 # 工作目录不一定是这个项目，相对路径它跑不起来。
@@ -39,6 +40,14 @@ BLOCKED_NO_RELAY = (
 BLOCKED_NOT_RUNNING = (
     "这个对话没在跑，手机上只能看。"
     "在电脑上把它打开，再跟它说一句「启动 phone-bridge」，就能发了。"
+)
+BLOCKED_WINDOWS_PIPE = (
+    "这个 Claude 会话没有可用的 Windows 消息管道。"
+    "先确认 Claude 版本支持 peer messaging，再重开这个对话。"
+)
+BLOCKED_WINDOWS_TOKEN = (
+    "这个 Claude 会话没有可用的入站凭据，手机不能发。"
+    "重开这个对话后再试。"
 )
 
 # 「没活进程的对话」怎么发：自己起一个 headless 会话，stdin 就是我们的
@@ -86,6 +95,27 @@ _ancestor_cache = {"at": 0.0, "pids": set()}
 
 
 def _pid_alive(pid):
+    if IS_WINDOWS:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        # SYNCHRONIZE 对普通进程足够查存活，且比 os.kill(pid, 0) 在 Windows
+        # 上可靠；后者会把信号 0 当成非法参数。
+        handle = open_process(0x00100000, False, pid)
+        if handle:
+            close_handle(handle)
+            return True
+        # 有权读到句柄但没权限打开进程时，保守当作还活着，避免把会话误标成
+        # 没在跑。ERROR_ACCESS_DENIED = 5。
+        return ctypes.get_last_error() == 5
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -99,6 +129,26 @@ def _fmt_tokens(n):
     if n >= 10000:
         return "%.1f万" % (n / 10000.0)
     return str(n)
+
+
+def _windows_registry_rank(info):
+    """同一 sessionId 有多条登记时，挑最适合接收消息的那条。
+
+    Windows 的 peer 协议把管道和 token 分开登记。交互会话优先；如果只有
+    headless/bg 那条带管道，也允许它作为兜底。`updatedAt` 只用于同级别中
+    打破平局。
+    """
+    kind = str(info.get("kind") or "")
+    if kind == "interactive":
+        kind_rank = 2
+    elif info.get("messagingSocketPath"):
+        kind_rank = 1
+    else:
+        kind_rank = 0
+    updated = info.get("updatedAt") or info.get("statusUpdatedAt") or 0
+    if not isinstance(updated, (int, float)):
+        updated = 0
+    return (bool(info.get("messagingSocketPath")), kind_rank, updated)
 
 
 def _registry():
@@ -120,13 +170,18 @@ def _registry():
     found = {}
     for path in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
         try:
-            with open(path) as fh:
+            with open(path, encoding="utf-8") as fh:
                 info = json.load(fh)
         except (OSError, ValueError):
             continue  # 半写完的文件，下次再看
         pid, sid = info.get("pid"), info.get("sessionId")
         if isinstance(pid, int) and sid and _pid_alive(pid):
-            found[sid] = info
+            if IS_WINDOWS:
+                old = found.get(sid)
+                if old is None or _windows_registry_rank(info) > _windows_registry_rank(old):
+                    found[sid] = info
+            else:
+                found[sid] = info
     _registry_cache["at"] = now
     _registry_cache["map"] = found
     return found
@@ -456,9 +511,104 @@ def _can_reach(session_pid):
     return session_pid in _my_ancestors()
 
 
+def _windows_pipe_token(info):
+    """读取 Windows peer 协议的连接 token。
+
+    token 不写在会话登记里，而是在同目录的 `<pid>.<hash>.key`。用
+    `procStart` / `pidDomain` 校验，避免 pid 被复用后拿到旧 token。
+    """
+    pid = info.get("pid")
+    if not isinstance(pid, int):
+        return None
+    wanted_start = info.get("procStart")
+    wanted_domain = info.get("pidDomain")
+    paths = glob.glob(os.path.join(SESSIONS_DIR, "%d.*.key" % pid))
+    for path in sorted(paths, key=os.path.getmtime, reverse=True):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if wanted_start and rec.get("procStartFt") != wanted_start:
+            continue
+        if wanted_domain and rec.get("pidDomain") not in (None, wanted_domain):
+            continue
+        token = rec.get("peerToken")
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
+def _windows_pipe_send(path, token, text):
+    """向 Claude 的 Windows 命名管道写 auth + user 两行。"""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    write_file = kernel32.WriteFile
+    write_file.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    write_file.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    invalid = ctypes.c_void_p(-1).value
+    handle = create_file(
+        path,
+        0x40000000,  # GENERIC_WRITE
+        0,
+        None,
+        3,  # OPEN_EXISTING
+        0,
+        None,
+    )
+    if handle == invalid:
+        raise OSError(ctypes.get_last_error(), "打不开 Claude 命名管道：%s" % path)
+
+    auth = json.dumps(
+        {"type": "auth", "token": token},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    frame = json.dumps(
+        {"type": "user", "message": {"role": "user", "content": text}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    payload = auth + frame
+    written = wintypes.DWORD(0)
+    try:
+        buf = ctypes.create_string_buffer(payload)
+        if not write_file(handle, buf, len(payload), ctypes.byref(written), None):
+            raise OSError(ctypes.get_last_error(), "写 Claude 命名管道失败：%s" % path)
+        if written.value != len(payload):
+            raise OSError("Claude 命名管道只收下了 %d/%d 字节" % (written.value, len(payload)))
+    finally:
+        close_handle(handle)
+    time.sleep(0.2)
+    return {"ok": True, "via": "windows-pipe"}
+
+
 def _iter_jsonl(path, max_lines=None):
     try:
-        with open(path, errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
                 if max_lines is not None and i >= max_lines:
                     return
@@ -768,6 +918,19 @@ class ClaudeAdapter(Adapter):
         第三条路（自起 headless 会话）默认关掉了，见文件头的 ALLOW_SPAWN。
         """
         pid = _live_claude_procs().get(sid)
+        if IS_WINDOWS:
+            info = _registry().get(sid)
+            if info is None:
+                if ALLOW_SPAWN:
+                    return "spawn", None, None
+                return None, None, "这个对话没在跑，手机上只能看。"
+            pipe_path = info.get("messagingSocketPath")
+            if not pipe_path:
+                return None, None, BLOCKED_WINDOWS_PIPE
+            token = _windows_pipe_token(info)
+            if not token:
+                return None, None, BLOCKED_WINDOWS_TOKEN
+            return "pipe", {"path": pipe_path, "token": token}, None
         if pid is None:
             if ALLOW_SPAWN:
                 return "spawn", None, None
@@ -817,6 +980,8 @@ class ClaudeAdapter(Adapter):
         kind, target, why = self._route(sid)
         if kind is None:
             raise RuntimeError(why)
+        if kind == "pipe":
+            return _windows_pipe_send(target["path"], target["token"], _envelope(text))
         if kind == "relay":
             return _relay_send(target, text)
         if kind == "spawn":
